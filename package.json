@@ -1,0 +1,39 @@
+{
+  "name": "timesheet-logger",
+  "version": "0.1.0",
+  "description": "Always-on-top Windows overlay for planning the week, tracking time against client projects, and exporting Markdown for Cursor to draft customer timesheet notes.",
+  "main": "./out/main/index.js",
+  "author": "mikha.jeon",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "icon": "node scripts/make-icon.mjs",
+    "predev": "node scripts/make-icon.mjs",
+    "prebuild": "node scripts/make-icon.mjs",
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "package": "npm run build && electron-builder --win --dir",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "comments": {
+    "overrides": "node-gyp@9 (pulled in by electron-builder) wants http-proxy-agent@5, whose @tootallnate/once dependency is blocked by the corporate proxy. v7 drops that dependency and is API-compatible; nothing here builds native modules, so node-gyp is never actually exercised."
+  },
+  "overrides": {
+    "http-proxy-agent": "^7.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11"
+  }
+}

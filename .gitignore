@@ -1,13 +1,10 @@
-node_modules/
-out/
-dist/
-release/
-*.log
+__pycache__/
+*.pyc
+
+# Screenshots from tests/capture.ps1
+shots/
 
 # Local time data and generated notes stay on your machine by default.
 # Delete these two lines if you want your timesheet history version-controlled.
 data/
 exports/
-
-resources/tray.png
-resources/tray-active.png

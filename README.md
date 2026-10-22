@@ -5,13 +5,12 @@ projects, and exporting a Markdown summary that Cursor turns into customer-facin
 timesheet notes.
 
 ```
-npm install
-npm run dev
+python run.py
 ```
 
-> **On the Datacom network, `npm install` needs two things first.** See
-> [Corporate network notes](#corporate-network-notes) — TLS inspection and a Zscaler
-> rule on `.gz` downloads both get in the way.
+That's the whole setup. **There is nothing to install** — the app uses only the Python
+standard library (`tkinter`, `ctypes`, `json`, `dataclasses`), so it needs no package
+downloads and no approval for third-party dependencies.
 
 ## The loop it's built around
 
@@ -19,7 +18,7 @@ npm run dev
 2. **Track** during the day in the Today tab — start/stop timer, or type hours in after the fact.
 3. **Export** a week (or a single day) to `exports/2026-W43.md`.
 4. **Draft** the customer note by asking Cursor to work from that file. The Export tab has a
-   "Copy Cursor prompt" button; `.cursor/rules/timesheet-note.mdc` tells Cursor the house style.
+   "Copy Cursor prompt" button, and `.cursor/rules/timesheet-note.mdc` tells Cursor the house style.
 
 ## Overlay behaviour
 
@@ -28,11 +27,15 @@ npm run dev
 | `Ctrl`+`Alt`+`T` | Show / hide the overlay |
 | `Ctrl`+`Alt`+`A` | Toggle always-on-top |
 | `Ctrl`+`Alt`+`S` | Stop the running timer, or resume the last task |
+| `Esc` | Collapse to the floating pill |
 
-Closing the window parks it in the system tray — the timer keeps running. Quit properly
-from the tray menu. The pin button in the title bar flips always-on-top, the `⇤` button
-widens the window for week planning, and Setup has an opacity slider for when you want it
-to sit quietly over whatever you're working in.
+The window is frameless — drag it by its header. The pin button flips always-on-top, `⇤`
+widens it for week planning, and Setup has an opacity slider for when you want it to sit
+quietly over whatever you're working in.
+
+`–` collapses the overlay to a thin pill that still shows the running timer; double-click
+it to expand. There's no system-tray icon on purpose: tray support would mean a third-party
+package, and the pill does the same job without one.
 
 ## Data model
 
@@ -43,7 +46,10 @@ to sit quietly over whatever you're working in.
 - **Entry** — minutes actually spent, from the timer or typed in, with a note.
 
 Time is always stored to the exact minute. Rounding (default: nearest 15) is applied only
-when exporting, so the underlying record stays honest.
+when exporting, so the underlying record stays honest — the export footer always shows the
+unrounded total so you can see what the rounding did.
+
+Durations accept `1.5`, `90m`, `1h30`, `1h 30m`, `1:30` and `:45` wherever you type one.
 
 ## Where things live
 
@@ -53,41 +59,39 @@ when exporting, so the underlying record stays honest.
 | Window position | `data/window.json` |
 | Generated notes | `exports/*.md` |
 
-Both are gitignored by default. Delete those lines from `.gitignore` if you'd rather keep
-your history version-controlled. Set `TIMESHEET_HOME` to put them somewhere else — a
-packaged build defaults to `Documents\TimesheetLogger`.
+Both are gitignored by default; delete those lines from `.gitignore` if you'd rather keep
+your history version-controlled. Set `TIMESHEET_HOME` to put them somewhere else.
+
+A file that fails to parse is moved aside as `timesheet.corrupt-<timestamp>.json` rather
+than being overwritten, so a bad write can't cost you a week of tracking.
 
 ## Writing a note by hand
 
-The export is readable on its own. **Timesheet lines** is the table of hours to key in;
-**Work carried out, by project** is the narrative source, already grouped the way a customer
-note is written.
+The export reads fine on its own. **Timesheet lines** is the table of hours to key in;
+**Work carried out, by project** is the narrative source, already grouped per K-code the
+way a customer note gets written.
 
-## Corporate network notes
-
-Two separate things block `npm install` on this machine.
-
-**1. TLS inspection.** The proxy re-signs HTTPS with a root CA that Node doesn't trust, so
-npm fails with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` — after retrying silently for minutes.
-Node 22.15+ can read the Windows certificate store instead:
-
-```powershell
-setx NODE_OPTIONS "--use-system-ca"   # once, then reopen the terminal
-```
-
-**2. Zscaler blocks `.gz` downloads.** Tarballs from `registry.npmjs.org` return 403 with a
-"Are you sure you want to visit this site? You are downloading gz filetype" caution page.
-npm can't click Continue, so every package fails. Options, best first:
-
-- Get IT to exempt `registry.npmjs.org` from the gz-download caution rule.
-- Point npm at an internal Artifactory/Nexus mirror if one exists.
-- Run `npm install` once off the corporate network; `node_modules/` is portable afterwards.
-
-PyPI is unaffected — wheels are zips, not gzip — which is why Python tooling works here.
-
-## Packaging
+## Development
 
 ```
-npm run package   # unpacked build in release/win-unpacked
-npm run dist      # NSIS installer in release/
+python -m unittest discover -s tests   # domain logic: parsing, store, export
+python tests/gui_smoke.py              # builds every tab and closes
+python tests/seed_demo.py              # fills TIMESHEET_HOME with a plausible week
+powershell -File tests/capture.ps1     # screenshots each tab into shots/
 ```
+
+`timesheet/` splits into a GUI-free core (`models`, `store`, `dates`, `markdown`) and the
+tkinter front end in `timesheet/ui/`. The core has no tkinter import, so it stays testable
+without a desktop session.
+
+### A note on tkinter
+
+Two Tk behaviours cost real debugging time and are worth knowing before editing the UI:
+
+- **Widget variables are only weakly referenced.** A `BooleanVar` created as a local is
+  garbage-collected and its checkbox silently renders unchecked. Views park theirs in
+  `self._vars`.
+- **Setting a widget's initial value fires its callback.** An opacity slider that saves on
+  change will re-enter the view that is still building it. Store writes that come from a
+  widget callback are deferred to the idle queue (`Overlay.refresh`), and `patch_settings`
+  ignores no-op writes.

@@ -46,6 +46,7 @@ class Overlay:
         self.root.bind("<Escape>", lambda _e: self.collapse(True))
 
         self.show_tab("Today")
+        self.refresh()  # a timer may already be running from a previous session
         self._tick()
         self._pump()
 
@@ -120,7 +121,10 @@ class Overlay:
         self.timer_title.pack(fill="x")
 
         self.timer_note = theme.entry(middle)
-        self.timer_note.bind("<FocusOut>", lambda _e: self._commit_timer_note())
+        self.read_timer_note = theme.add_placeholder(
+            self.timer_note, "What are you doing? This becomes the customer note."
+        )
+        self.timer_note.bind("<FocusOut>", lambda _e: self._commit_timer_note(), add="+")
         self.timer_note.bind("<Return>", lambda _e: self._commit_timer_note())
 
         self.timer_clock = theme.label(
@@ -139,13 +143,19 @@ class Overlay:
         bar = theme.frame(self.shell, bg=theme.BG_RAISED)
         bar.pack(fill="x")
         self.tab_buttons: dict[str, tk.Button] = {}
+        self.tab_underlines: dict[str, tk.Frame] = {}
         for name in TABS:
+            column = theme.frame(bar, bg=theme.BG_RAISED)
+            column.pack(side="left")
             btn = theme.button(
-                bar, name, lambda n=name: self.show_tab(n),
+                column, name, lambda n=name: self.show_tab(n),
                 bg=theme.BG_RAISED, fg=theme.MUTED, padx=11, pady=5,
             )
-            btn.pack(side="left")
+            btn.pack()
+            underline = theme.frame(column, bg=theme.BG_RAISED, height=2)
+            underline.pack(fill="x")
             self.tab_buttons[name] = btn
+            self.tab_underlines[name] = underline
         theme.hairline(self.shell).pack(fill="x")
 
     def _build_pill(self) -> None:
@@ -291,7 +301,9 @@ class Overlay:
     def show_tab(self, name: str) -> None:
         self.active_tab = name
         for tab, btn in self.tab_buttons.items():
-            btn.config(fg=theme.TEXT if tab == name else theme.MUTED)
+            active = tab == name
+            btn.config(fg=theme.TEXT if active else theme.MUTED)
+            self.tab_underlines[tab].config(bg=theme.ACCENT if active else theme.BG_RAISED)
 
         for view in self._views.values():
             view.frame.pack_forget()  # type: ignore[attr-defined]
@@ -356,15 +368,16 @@ class Overlay:
 
         if not self.timer_note.winfo_ismapped():
             self.timer_note.pack(fill="x", pady=(2, 6))
-        if self.timer_note.get() != timer.note and self.root.focus_get() is not self.timer_note:
+        if self.read_timer_note() != timer.note and self.root.focus_get() is not self.timer_note:
             self.timer_note.delete(0, "end")
             self.timer_note.insert(0, timer.note)
+            self.timer_note.config(fg=theme.TEXT)
         if not self.timer_stop.winfo_ismapped():
             self.timer_stop.pack(side="right", padx=(0, 8))
 
     def _commit_timer_note(self) -> None:
         if self.store.db.active_timer:
-            self.store.set_timer_note(self.timer_note.get())
+            self.store.set_timer_note(self.read_timer_note())
 
     # -- loops --------------------------------------------------------------
 

@@ -1,9 +1,6 @@
 __pycache__/
 *.pyc
 
-# Screenshots from tests/capture.ps1
-shots/
-
 # Local time data and generated notes stay on your machine by default.
 # Delete these two lines if you want your timesheet history version-controlled.
 data/

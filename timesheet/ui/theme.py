@@ -180,6 +180,33 @@ def ellipsize(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
+def add_placeholder(widget: tk.Entry, text: str) -> Callable[[], str]:
+    """Greys in hint text while the field is empty.
+
+    Returns a getter that yields "" rather than the hint, so callers never
+    persist the placeholder as if it were real input.
+    """
+    state = {"showing": False}
+
+    def show() -> None:
+        if not widget.get():
+            widget.insert(0, text)
+            widget.config(fg=MUTED)
+            state["showing"] = True
+
+    def clear(_event: tk.Event) -> None:
+        if state["showing"]:
+            widget.delete(0, "end")
+            widget.config(fg=TEXT)
+            state["showing"] = False
+
+    widget.bind("<FocusIn>", clear, add="+")
+    widget.bind("<FocusOut>", lambda _e: show(), add="+")
+    show()
+
+    return lambda: "" if state["showing"] else widget.get()
+
+
 def pill(parent: tk.Misc, text: str, *, fg: str = "#a9b3cc", bg: str = BG_INPUT) -> tk.Label:
     """Small monospace chip, used for K-codes."""
     return tk.Label(parent, text=text, bg=bg, fg=fg, font=FONT_MONO, padx=4, pady=0)

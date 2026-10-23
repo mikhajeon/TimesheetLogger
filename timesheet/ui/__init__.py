@@ -1,1 +1,1 @@
-"""Tkinter front end."""
+"""Tkinter front end for the overlay."""

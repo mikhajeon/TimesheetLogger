@@ -1,8 +1,8 @@
-"""Setup: clients, projects and K-codes, plus overlay preferences."""
+"""The Setup tab: clients, projects and K-codes, plus overlay preferences."""
 
 from __future__ import annotations
 
-import subprocess
+import os
 import tkinter as tk
 
 from .. import paths
@@ -20,49 +20,45 @@ ROUNDING_CHOICES = {
     "Nearest 30 minutes": 30,
 }
 
+SHORTCUTS = [
+    ("Ctrl+Alt+T", "Show or hide the overlay"),
+    ("Ctrl+Alt+A", "Toggle always on top"),
+    ("Ctrl+Alt+S", "Stop the timer, or resume the last task"),
+    ("Esc", "Collapse to the compact bar"),
+]
+
 
 class SetupView:
     def __init__(self, parent: tk.Misc, store: Store, overlay) -> None:
         self.store = store
         self.overlay = overlay
-        self.show_archived = tk.BooleanVar(value=False)
-
-        # Tk only holds a weak link to a widget's variable, so anything created
-        # inside a method has to be parked here or it gets collected and the
-        # checkbox silently renders unchecked.
-        self._vars: list[tk.Variable] = []
-
         self.frame = theme.frame(parent)
-        self.scroll = ScrollFrame(self.frame)
-        self.scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        self._show_archived = tk.BooleanVar(value=False)
 
-    def _keep(self, variable: tk.Variable) -> tk.Variable:
-        self._vars.append(variable)
-        return variable
+        self.scroll = ScrollFrame(self.frame)
+        self.scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
     def refresh(self) -> None:
         self.scroll.clear()
-        self._vars.clear()
-        self._preferences()
-        self._clients()
-        self._projects()
-        self._shortcuts()
-        self._files()
+        body = self.scroll.body
+        self._preferences(body)
+        self._clients(body)
+        self._projects(body)
+        self._shortcuts(body)
+        self._files(body)
 
-    # -- helpers -------------------------------------------------------------
+    # -- sections -----------------------------------------------------------
 
-    def _section(self, title: str) -> tk.Frame:
-        theme.label(
-            self.scroll.body, title.upper(), fg=theme.MUTED, font=theme.FONT_HEAD
-        ).pack(fill="x", pady=(12, 5))
-        box = theme.frame(self.scroll.body)
+    def _section(self, parent: tk.Misc, title: str) -> tk.Frame:
+        theme.label(parent, title.upper(), fg=theme.MUTED, font=theme.FONT_HEAD).pack(
+            fill="x", pady=(12, 4)
+        )
+        box = theme.frame(parent)
         box.pack(fill="x")
         return box
 
-    # -- sections ------------------------------------------------------------
-
-    def _preferences(self) -> None:
-        box = self._section("Preferences")
+    def _preferences(self, parent: tk.Misc) -> None:
+        box = self._section(parent, "Preferences")
         settings = self.store.db.settings
 
         row = theme.frame(box)
@@ -72,199 +68,239 @@ class SetupView:
             (k for k, v in ROUNDING_CHOICES.items() if v == settings.rounding_minutes),
             "Nearest 15 minutes",
         )
-        rounding = self._keep(tk.StringVar(value=current))
+        choice = tk.StringVar(value=current)
         theme.option_menu(
-            box, rounding, list(ROUNDING_CHOICES),
-            lambda label: self.store.patch_settings(rounding_minutes=ROUNDING_CHOICES[label]),
-        ).pack(fill="x", pady=(0, 6))
+            row,
+            choice,
+            list(ROUNDING_CHOICES),
+            command=lambda value: self.store.patch_settings(
+                rounding_minutes=ROUNDING_CHOICES[value]
+            ),
+        ).pack(side="right")
 
         row = theme.frame(box)
         row.pack(fill="x", pady=2)
         theme.label(
-            row, f"Daily target ({format_minutes(settings.daily_target_minutes)})",
+            row,
+            f"Daily target ({format_minutes(settings.daily_target_minutes)})",
             font=theme.FONT_SMALL,
         ).pack(side="left")
-        target = theme.entry(row, width=7)
+        target = theme.entry(row, width=7, font=theme.FONT_SMALL)
         target.insert(0, f"{settings.daily_target_minutes / 60:g}")
         target.pack(side="right")
-        target.bind(
-            "<FocusOut>",
-            lambda _e, w=target: self.store.patch_settings(
-                daily_target_minutes=parse_duration(w.get()) or settings.daily_target_minutes
-            ),
-        )
+        target.bind("<FocusOut>", lambda _e: self._commit_target(target))
 
         row = theme.frame(box)
-        row.pack(fill="x", pady=(8, 2))
-        theme.label(
-            row, f"Overlay opacity — {int(settings.opacity * 100)}%", font=theme.FONT_SMALL
-        ).pack(side="left")
-        slider = tk.Scale(
-            box, from_=0.3, to=1.0, resolution=0.05, orient="horizontal",
-            bg=theme.BG, fg=theme.TEXT, troughcolor=theme.BG_INPUT, highlightthickness=0,
-            bd=0, sliderrelief="flat", activebackground=theme.ACCENT, showvalue=False,
+        row.pack(fill="x", pady=2)
+        theme.label(row, "Overlay opacity", font=theme.FONT_SMALL).pack(side="left")
+        percent = theme.label(
+            row, f"{round(settings.opacity * 100)}%", fg=theme.MUTED, font=theme.FONT_TINY
         )
-        slider.set(settings.opacity)
-        # Attached only after the initial value is in place, so positioning the
-        # handle doesn't count as the user moving it.
-        slider.config(command=lambda value: self.overlay.set_opacity(float(value)))
-        slider.pack(fill="x")
 
-        on_top = self._keep(tk.BooleanVar(value=settings.always_on_top))
+        def on_opacity(value: str) -> None:
+            self.overlay.set_opacity(float(value))
+            percent.config(text=f"{round(float(value) * 100)}%")
+
+        opacity = tk.Scale(
+            row,
+            from_=0.3,
+            to=1.0,
+            resolution=0.05,
+            orient="horizontal",
+            showvalue=False,
+            length=130,
+            bg=theme.BG_HOVER,  # this is the slider handle; must contrast the trough
+            fg=theme.TEXT,
+            troughcolor=theme.BG_INPUT,
+            activebackground=theme.ACCENT,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief="flat",
+            command=on_opacity,
+        )
+        opacity.set(settings.opacity)
+        opacity.pack(side="right")
+        percent.pack(side="right", padx=4)
+
+        # Held on the instance because Tk keeps only a weak reference to the
+        # variable; a local would be collected and the box would render empty.
+        self._pinned = tk.BooleanVar(value=settings.always_on_top)
         theme.checkbox(
-            box, "Always on top", on_top, self.overlay.toggle_always_on_top
-        ).pack(fill="x", pady=(6, 0))
+            box, "Always on top", self._pinned, self.overlay.toggle_always_on_top
+        ).pack(fill="x", pady=2)
 
-    def _clients(self) -> None:
-        box = self._section("Clients")
-        clients = [
-            c for c in self.store.db.clients if self.show_archived.get() or not c.archived
-        ]
-        for client in clients:
+    def _clients(self, parent: tk.Misc) -> None:
+        box = self._section(parent, "Clients")
+        for client in self.store.db.clients:
+            if client.archived and not self._show_archived.get():
+                continue
             row = theme.frame(box)
             row.pack(fill="x", pady=1)
 
-            name = theme.entry(row)
+            name = theme.entry(row, font=theme.FONT_SMALL)
             name.insert(0, client.name)
             name.pack(side="left", fill="x", expand=True)
             name.bind(
                 "<FocusOut>",
-                lambda _e, i=client.id, w=name: self.store.update_client(i, name=w.get()),
+                lambda _e, cid=client.id, w=name: self.store.update_client(cid, name=w.get()),
             )
 
+            internal = tk.BooleanVar(value=client.is_internal)
+            theme.checkbox(
+                row,
+                "Internal",
+                internal,
+                lambda cid=client.id, v=internal: self.store.update_client(
+                    cid, is_internal=v.get()
+                ),
+            ).pack(side="left", padx=4)
+
             theme.button(
-                row, "Restore" if client.archived else "Archive",
-                lambda i=client.id, a=client.archived: self.store.update_client(i, archived=not a),
-                bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
+                row,
+                "Restore" if client.archived else "Archive",
+                lambda cid=client.id, a=client.archived: self.store.update_client(
+                    cid, archived=not a
+                ),
+                bg=theme.BG,
+                fg=theme.MUTED,
+                font=theme.FONT_TINY,
             ).pack(side="right")
 
-            internal = self._keep(tk.BooleanVar(value=client.is_internal))
-            theme.checkbox(
-                row, "Internal", internal,
-                lambda i=client.id, v=internal: self.store.update_client(i, is_internal=v.get()),
-            ).pack(side="right", padx=4)
-
         row = theme.frame(box)
-        row.pack(fill="x", pady=(5, 0))
-        new_client = theme.entry(row)
-        new_client.pack(side="left", fill="x", expand=True)
-        theme.button(
-            row, "Add client", lambda w=new_client: self._add_client(w),
-            bg=theme.BG_INPUT, font=theme.FONT_SMALL,
-        ).pack(side="right", padx=(5, 0))
-        new_client.bind("<Return>", lambda _e, w=new_client: self._add_client(w))
+        row.pack(fill="x", pady=(4, 0))
+        new_name = theme.entry(row, font=theme.FONT_SMALL)
+        new_name.pack(side="left", fill="x", expand=True)
 
-    def _add_client(self, widget: tk.Entry) -> None:
-        name = widget.get().strip()
-        if name:
-            self.store.add_client(name)
+        def add() -> None:
+            if new_name.get().strip():
+                self.store.add_client(new_name.get().strip())
 
-    def _projects(self) -> None:
-        box = self._section("Projects & K-codes")
-        projects = [
-            p for p in self.store.db.projects if self.show_archived.get() or not p.archived
-        ]
-        client_names = [c.name for c in self.store.db.clients]
+        theme.button(row, "Add client", add, font=theme.FONT_SMALL).pack(side="right", padx=(4, 0))
+        new_name.bind("<Return>", lambda _e: add())
 
-        for project in projects:
+    def _projects(self, parent: tk.Misc) -> None:
+        box = self._section(parent, "Projects & K-codes")
+        clients = {c.name: c.id for c in self.store.db.clients}
+
+        for project in self.store.db.projects:
+            if project.archived and not self._show_archived.get():
+                continue
             row = theme.frame(box)
             row.pack(fill="x", pady=1)
 
-            k_code = theme.entry(row, width=8, font=theme.FONT_MONO)
-            k_code.insert(0, project.k_code)
-            k_code.pack(side="left")
-            k_code.bind(
+            code = theme.entry(row, width=8, font=theme.FONT_MONO)
+            code.insert(0, project.k_code)
+            code.pack(side="left")
+            code.bind(
                 "<FocusOut>",
-                lambda _e, i=project.id, w=k_code: self.store.update_project(i, k_code=w.get()),
+                lambda _e, pid=project.id, w=code: self.store.update_project(pid, k_code=w.get()),
             )
 
-            name = theme.entry(row)
+            name = theme.entry(row, font=theme.FONT_SMALL)
             name.insert(0, project.name)
-            name.pack(side="left", fill="x", expand=True, padx=4)
+            name.pack(side="left", fill="x", expand=True, padx=3)
             name.bind(
                 "<FocusOut>",
-                lambda _e, i=project.id, w=name: self.store.update_project(i, name=w.get()),
+                lambda _e, pid=project.id, w=name: self.store.update_project(pid, name=w.get()),
             )
 
+            billable = tk.BooleanVar(value=project.default_billable)
+            theme.checkbox(
+                row,
+                "Billable",
+                billable,
+                lambda pid=project.id, v=billable: self.store.update_project(
+                    pid, default_billable=v.get()
+                ),
+            ).pack(side="left")
+
             theme.button(
-                row, "Restore" if project.archived else "Archive",
-                lambda i=project.id, a=project.archived: self.store.update_project(i, archived=not a),
-                bg=theme.BG, fg=theme.MUTED, font=theme.FONT_SMALL,
+                row,
+                "Restore" if project.archived else "Archive",
+                lambda pid=project.id, a=project.archived: self.store.update_project(
+                    pid, archived=not a
+                ),
+                bg=theme.BG,
+                fg=theme.MUTED,
+                font=theme.FONT_TINY,
             ).pack(side="right")
 
-            billable = self._keep(tk.BooleanVar(value=project.default_billable))
-            theme.checkbox(
-                row, "Billable", billable,
-                lambda i=project.id, v=billable: self.store.update_project(
-                    i, default_billable=v.get()
-                ),
-            ).pack(side="right", padx=4)
-
-            client = self.store.db.client(project.client_id)
-            theme.label(
-                box, f"    {client.name if client else '?'}", fg=theme.MUTED, font=theme.FONT_TINY
-            ).pack(fill="x")
+        if not clients:
+            return
 
         row = theme.frame(box)
-        row.pack(fill="x", pady=(5, 0))
+        row.pack(fill="x", pady=(4, 0))
         new_code = theme.entry(row, width=8, font=theme.FONT_MONO)
         new_code.pack(side="left")
-        new_name = theme.entry(row)
-        new_name.pack(side="left", fill="x", expand=True, padx=4)
-        client_var = self._keep(tk.StringVar(value=client_names[0] if client_names else ""))
-        theme.option_menu(row, client_var, client_names or [""]).pack(side="left")
-        theme.button(
-            row, "Add",
-            lambda: self._add_project(new_code, new_name, client_var),
-            bg=theme.BG_INPUT, font=theme.FONT_SMALL,
-        ).pack(side="right", padx=(5, 0))
+        new_name = theme.entry(row, font=theme.FONT_SMALL)
+        new_name.pack(side="left", fill="x", expand=True, padx=3)
+        client_choice = tk.StringVar(value=next(iter(clients)))
+        theme.option_menu(row, client_choice, list(clients)).pack(side="left")
+
+        def add() -> None:
+            name = new_name.get().strip()
+            if not name:
+                return
+            client_id = clients[client_choice.get()]
+            client = self.store.db.client(client_id)
+            self.store.add_project(
+                client_id,
+                name,
+                new_code.get().strip() or "NCC",
+                default_billable=not (client.is_internal if client else False),
+            )
+
+        theme.button(row, "Add", add, font=theme.FONT_SMALL).pack(side="right", padx=(4, 0))
 
         theme.checkbox(
-            box, "Show archived", self.show_archived,
-            lambda: self.frame.after_idle(self.refresh),
-        ).pack(fill="x", pady=(6, 0))
+            box, "Show archived", self._show_archived, self.refresh
+        ).pack(fill="x", pady=(4, 0))
 
-    def _add_project(self, code: tk.Entry, name: tk.Entry, client_var: tk.StringVar) -> None:
-        title = name.get().strip()
-        client = next((c for c in self.store.db.clients if c.name == client_var.get()), None)
-        if not title or client is None:
-            return
-        self.store.add_project(
-            client.id, title, code.get().strip() or "NCC", not client.is_internal
-        )
-
-    def _shortcuts(self) -> None:
-        box = self._section("Shortcuts")
-        rows = [
-            ("Ctrl + Alt + T", "Show or hide the overlay"),
-            ("Ctrl + Alt + A", "Toggle always on top"),
-            ("Ctrl + Alt + S", "Stop the timer, or resume the last task"),
-            ("Esc", "Collapse to the floating pill"),
-        ]
-        for keys, description in rows:
+    def _shortcuts(self, parent: tk.Misc) -> None:
+        box = self._section(parent, "Shortcuts")
+        for keys, description in SHORTCUTS:
             row = theme.frame(box)
             row.pack(fill="x", pady=1)
-            theme.label(row, keys, font=theme.FONT_MONO, fg=theme.TEXT, width=16).pack(side="left")
-            theme.label(row, description, fg=theme.MUTED, font=theme.FONT_SMALL).pack(side="left")
+            theme.label(
+                row, keys, bg=theme.BG_INPUT, fg=theme.TEXT, font=theme.FONT_MONO, padx=5
+            ).pack(side="left")
+            theme.label(row, description, fg=theme.MUTED, font=theme.FONT_SMALL).pack(
+                side="left", padx=6
+            )
 
         failed = getattr(self.overlay.hotkeys, "failed", [])
         if failed:
             theme.label(
                 box,
-                "Another app already owns: " + ", ".join(failed),
-                fg=theme.DANGER, font=theme.FONT_TINY, wraplength=380, justify="left",
+                f"Already taken by another app: {', '.join(failed)}",
+                fg=theme.DANGER,
+                font=theme.FONT_TINY,
             ).pack(fill="x", pady=(4, 0))
 
-    def _files(self) -> None:
-        box = self._section("Files")
+    def _files(self, parent: tk.Misc) -> None:
+        box = self._section(parent, "Files")
         for caption, target in (
             ("Data", paths.data_file()),
             ("Exports", paths.exports_dir()),
         ):
             theme.button(
-                box, f"{caption}: {target}",
-                lambda t=target: subprocess.Popen(
-                    ["explorer", str(t if t.is_dir() else t.parent)]
-                ),
-                bg=theme.BG_INPUT, fg=theme.MUTED, font=theme.FONT_TINY, pady=4,
+                box,
+                f"{caption}: {target}",
+                lambda t=target: self._open(t),
+                bg=theme.BG_INPUT,
+                fg=theme.MUTED,
+                font=theme.FONT_TINY,
+                anchor="w",
             ).pack(fill="x", pady=1)
+
+    # -- actions -------------------------------------------------------------
+
+    def _open(self, target) -> None:
+        directory = target if target.is_dir() else target.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        os.startfile(directory)  # noqa: S606 - opening Explorer is the intent
+
+    def _commit_target(self, widget: tk.Entry) -> None:
+        minutes = parse_duration(widget.get())
+        if minutes:
+            self.store.patch_settings(daily_target_minutes=minutes)

@@ -5,17 +5,26 @@ projects, and exporting a Markdown summary that Cursor turns into customer-facin
 timesheet notes.
 
 ```
-python run.py
+python run.py          # with a console, for development
+pythonw run.pyw        # silent launch, for daily use
 ```
 
-That's the whole setup. **There is nothing to install** — the app uses only the Python
-standard library (`tkinter`, `ctypes`, `json`, `dataclasses`), so it needs no package
-downloads and no approval for third-party dependencies.
+**No installation, no dependencies.** It runs on the Python standard library alone —
+`tkinter` for the UI, `ctypes` for the global hotkeys, `json` for storage. There is
+nothing to `pip install`.
+
+| Today | Week |
+| --- | --- |
+| ![Today tab](docs/preview-today.png) | ![Week tab](docs/preview-week.png) |
+
+| Export | Setup |
+| --- | --- |
+| ![Export tab](docs/preview-export.png) | ![Setup tab](docs/preview-setup.png) |
 
 ## The loop it's built around
 
 1. **Plan** the week in the Week tab — hours per task per day, grouped by client and K-code.
-2. **Track** during the day in the Today tab — start/stop timer, or type hours in after the fact.
+2. **Track** during the day in the Today tab — start/stop timer, or type hours in afterwards.
 3. **Export** a week (or a single day) to `exports/2026-W43.md`.
 4. **Draft** the customer note by asking Cursor to work from that file. The Export tab has a
    "Copy Cursor prompt" button, and `.cursor/rules/timesheet-note.mdc` tells Cursor the house style.
@@ -27,15 +36,14 @@ downloads and no approval for third-party dependencies.
 | `Ctrl`+`Alt`+`T` | Show / hide the overlay |
 | `Ctrl`+`Alt`+`A` | Toggle always-on-top |
 | `Ctrl`+`Alt`+`S` | Stop the running timer, or resume the last task |
-| `Esc` | Collapse to the floating pill |
+| `Esc` | Collapse to the compact bar |
 
-The window is frameless — drag it by its header. The pin button flips always-on-top, `⇤`
-widens it for week planning, and Setup has an opacity slider for when you want it to sit
-quietly over whatever you're working in.
+The pin button in the header flips always-on-top, `⇤` widens the window for week planning,
+and Setup has an opacity slider for when you want it to sit quietly over whatever you're
+working in. Drag it by the header.
 
-`–` collapses the overlay to a thin pill that still shows the running timer; double-click
-it to expand. There's no system-tray icon on purpose: tray support would mean a third-party
-package, and the pill does the same job without one.
+Collapsing leaves a thin always-on-top strip showing the running timer — double-click it to
+expand. That stands in for a system tray icon, which would have needed a third-party package.
 
 ## Data model
 
@@ -46,10 +54,20 @@ package, and the pill does the same job without one.
 - **Entry** — minutes actually spent, from the timer or typed in, with a note.
 
 Time is always stored to the exact minute. Rounding (default: nearest 15) is applied only
-when exporting, so the underlying record stays honest — the export footer always shows the
-unrounded total so you can see what the rounding did.
+when exporting, so the underlying record stays honest. The export footer always reports the
+unrounded total so you can see what rounding did.
 
-Durations accept `1.5`, `90m`, `1h30`, `1h 30m`, `1:30` and `:45` wherever you type one.
+## What the export looks like
+
+Two sections do the work. **Timesheet lines** is a table of bookable lines — one row per
+K-code per day per billable status, which is exactly how the hours get keyed in:
+
+| Date | Client | Project | K-code | Billable | Hours |
+| --- | --- | --- | --- | --- | --- |
+| 23 Oct | Acme Ltd | Platform Migration | `K-10234` | Yes | 4.00 |
+
+**Work carried out, by project** is the narrative source, already grouped per K-code the way
+a customer note is written, with your task notes nested underneath.
 
 ## Where things live
 
@@ -59,39 +77,35 @@ Durations accept `1.5`, `90m`, `1h30`, `1h 30m`, `1:30` and `:45` wherever you t
 | Window position | `data/window.json` |
 | Generated notes | `exports/*.md` |
 
-Both are gitignored by default; delete those lines from `.gitignore` if you'd rather keep
-your history version-controlled. Set `TIMESHEET_HOME` to put them somewhere else.
+`data/` and `exports/` are gitignored. Delete those lines from `.gitignore` if you'd rather
+version-control your history. Set `TIMESHEET_HOME` to put both somewhere else.
 
-A file that fails to parse is moved aside as `timesheet.corrupt-<timestamp>.json` rather
-than being overwritten, so a bad write can't cost you a week of tracking.
-
-## Writing a note by hand
-
-The export reads fine on its own. **Timesheet lines** is the table of hours to key in;
-**Work carried out, by project** is the narrative source, already grouped per K-code the
-way a customer note gets written.
+A corrupt data file is moved aside rather than overwritten, so a week of tracking is never
+lost to one bad write.
 
 ## Development
 
 ```
-python -m unittest discover -s tests   # domain logic: parsing, store, export
-python tests/gui_smoke.py              # builds every tab and closes
-python tests/seed_demo.py              # fills TIMESHEET_HOME with a plausible week
-powershell -File tests/capture.ps1     # screenshots each tab into shots/
+python tests\test_smoke.py     # domain logic: dates, store, persistence, export
+python tests\gui_smoke.py      # builds every tab and toggles the window states
+python scripts\capture_preview.py   # regenerate docs/preview-*.png from sample data
 ```
 
-`timesheet/` splits into a GUI-free core (`models`, `store`, `dates`, `markdown`) and the
-tkinter front end in `timesheet/ui/`. The core has no tkinter import, so it stays testable
-without a desktop session.
+`capture_preview.py` runs against throwaway data in a temp folder, so it never touches your
+real timesheet.
 
-### A note on tkinter
+## Why tkinter rather than Electron or Qt
 
-Two Tk behaviours cost real debugging time and are worth knowing before editing the UI:
+This was first built on Electron, then attempted on Qt. Neither could be installed on a
+Datacom machine:
 
-- **Widget variables are only weakly referenced.** A `BooleanVar` created as a local is
-  garbage-collected and its checkbox silently renders unchecked. Views park theirs in
-  `self._vars`.
-- **Setting a widget's initial value fires its callback.** An opacity slider that saves on
-  change will re-enter the view that is still building it. Store writes that come from a
-  widget callback are deferred to the idle queue (`Overlay.refresh`), and `patch_settings`
-  ignores no-op writes.
+- **Electron** — `npm install` could not fetch any package. The proxy serves a Zscaler
+  click-through caution page for `.gz` downloads, which npm can't answer, so every tarball
+  request returned 403. (That is a failed download, not a statement about any package's
+  approval status.) Node also needs `NODE_OPTIONS=--use-system-ca` here to trust the
+  TLS-inspection root certificate.
+- **Qt / PySide6** — downloads fine, but endpoint protection denies loading third-party
+  native DLLs from user-writable locations, so `import PySide6` fails with `Access is denied`.
+
+The standard library has none of these problems: it is already installed and already trusted.
+See the dependency policy rule for what may be added without approval.

@@ -50,11 +50,18 @@ def write_png(path: Path, width: int, height: int, bgra: bytes) -> None:
     )
 
 
-def capture(hwnd: int, path: Path) -> None:
+def capture(hwnd: int, path: Path, pad: int = 0) -> None:
+    """Screenshots a window, optionally with a margin of whatever is behind it.
+
+    The margin is for windows with rounded corners, where some of what shows
+    through is part of the picture.
+    """
     user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
 
     rect = wintypes.RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    rect.left, rect.top = rect.left - pad, rect.top - pad
+    rect.right, rect.bottom = rect.right + pad, rect.bottom + pad
     width, height = rect.right - rect.left, rect.bottom - rect.top
 
     screen_dc = user32.GetDC(0)
@@ -100,6 +107,7 @@ def capture(hwnd: int, path: Path) -> None:
 def seed_sample_data() -> None:
     from timesheet import paths
     from timesheet.dates import add_days, today
+    from timesheet.models import Recurrence
     from timesheet.store import Store
 
     store = Store(paths.data_file())
@@ -107,6 +115,7 @@ def seed_sample_data() -> None:
 
     acme = store.add_client("Acme Ltd")
     migration = store.add_project(acme.id, "Platform Migration", "K-10234", True)
+    store.add_project(acme.id, "Data Warehouse", "K-10412", True)  # shows the nesting
     northwind = store.add_client("Northwind Energy")
     portal = store.add_project(northwind.id, "Customer Portal", "K-10871", True)
     admin = store.db.projects[0]
@@ -116,7 +125,21 @@ def seed_sample_data() -> None:
     review = store.add_task(portal.id, "Design review with client", True)
     timesheets = store.add_task(admin.id, "Timesheets & internal admin", False)
 
+    # A Phase, for the Setup tab shot: a task reads as one the moment it
+    # picks up a child, shown nested underneath it rather than as a type.
+    go_live = store.add_task(migration.id, "Go-live", True)
+    store.add_subtask(go_live.id, "Final smoke test", True)
+
     day = today()
+
+    # A recurring note, for both shots: its own schedule, sharing the task's
+    # billing bucket rather than needing one of its own. Daily and unlogged,
+    # so it shows up as its own pending row without touching the Day tab's
+    # already-tuned totals.
+    store.add_recurring_note(
+        timesheets.id, "Daily stand-up", 15, Recurrence(frequency="daily", minutes=15, start=day)
+    )
+
     store.set_plan(runbook.id, day, 180)
     store.set_plan(tests.id, day, 120)
     store.set_plan(review.id, day, 60)
@@ -139,24 +162,110 @@ def main() -> None:
 
     seed_sample_data()
 
-    from timesheet.ui.overlay import Overlay
+    from timesheet.ui.overlay import FULL_SIZE, TAB_LABELS, TABS, Overlay
 
     app = Overlay()
-    app.root.geometry("470x700+60+60")
+    app.root.geometry("{}x{}+60+60".format(*FULL_SIZE))
     docs = ROOT / "docs"
     docs.mkdir(exist_ok=True)
 
     handle = ctypes.windll.user32.GetAncestor(app.root.winfo_id(), 2)  # GA_ROOT
 
-    for tab in ("Today", "Week", "Export", "Setup"):
-        app.show_tab(tab)
+    def settle() -> None:
         for _ in range(12):
             app.root.update()
         app.root.after(120, lambda: None)
         app.root.update()
-        capture(handle, docs / f"preview-{tab.lower()}.png")
 
+    settle()
+    # Becoming DPI-aware above scales up Tk's own font metrics to match
+    # whatever this monitor's actually running at, which real launches never
+    # opt into (see the module docstring) and ``FULL_SIZE`` was never sized
+    # for. Pack silently clips whichever tab button runs out of room rather
+    # than overflowing, so a shot taken at ``FULL_SIZE`` itself can crop the
+    # last tab's label to nothing — widen just the window used for the
+    # shots, never the app's own real default, to whatever the scaled tab
+    # bar actually asks for.
+    bar = app.tab_buttons["Today"].master.master
+    width = max(FULL_SIZE[0], bar.winfo_reqwidth() + 10)
+    if width != FULL_SIZE[0]:
+        app.root.geometry(f"{width}x{FULL_SIZE[1]}+60+60")
+        settle()
+
+    # Named for what's on the tab button, not the internal key — the key
+    # called "Setup" is the Preferences content these days.
+    for tab in TABS:
+        app.show_tab(tab)
+        settle()
+        capture(handle, docs / f"preview-{TAB_LABELS[tab].lower()}.png")
+
+    # One light-mode shot, so the README can show both palettes.
+    app.set_theme("light")
+    app.show_tab("Today")
+    settle()
+    capture(handle, docs / "preview-light.png")
+
+    capture_badges(app, handle, docs, settle)
     app.quit()
+
+
+#: Shows through the badge's rounded corners in the strip below. Mid grey,
+#: since neither palette's own background would show the other one's edges.
+BACKDROP = "#8a8f99"
+
+
+def capture_badges(app, handle: int, docs: Path, settle) -> None:
+    """The collapsed badge in both palettes, timer running and stopped.
+
+    Each shot takes in a margin around the window, because the corners are
+    rounded and what shows through them is part of what's being shown. A
+    plain window is parked behind to be that something.
+    """
+    import tkinter as tk
+
+    size, gap, scale = 46, 10, 2
+    backdrop = tk.Toplevel(app.root, bg=BACKDROP)
+    backdrop.overrideredirect(True)
+    # Topmost as well, or collapsing — which re-applies the overlay's own
+    # always-on-top — leaves the backdrop stranded below the desktop.
+    backdrop.attributes("-topmost", True)
+    backdrop.geometry(f"{size + gap * 2}x{size + gap * 2}+{60 - gap}+{60 - gap}")
+
+    shots = []
+    for palette in ("dark", "light"):
+        app.set_theme(palette)
+        app.collapse(True)
+        for running in (True, False):
+            if running:
+                app.store.start_timer(app.store.db.tasks[0].id)
+            elif app.store.db.active_timer is not None:
+                app.store.stop_timer()
+            app.root.geometry(f"{size}x{size}+60+60")
+            # Settle before ordering, not after: a pending theme rebuild
+            # re-applies the overlay's always-on-top and undoes the lift.
+            settle()
+            # lift() doesn't reliably raise a borderless window on Windows;
+            # re-asserting topmost does, and the last one asserted ends up on
+            # top of the others.
+            for window in (backdrop, app.root):
+                window.attributes("-topmost", False)
+                window.attributes("-topmost", True)
+                settle()
+            shot = docs / f"_badge-{palette}-{running}.png"
+            capture(handle, shot, pad=gap)
+            shots.append(shot)
+        app.collapse(False)
+        settle()
+    backdrop.destroy()
+
+    tiles = [tk.PhotoImage(file=str(shot)).zoom(scale) for shot in shots]
+    strip = tk.PhotoImage(width=sum(t.width() for t in tiles), height=tiles[0].height())
+    for index, tile in enumerate(tiles):
+        strip.tk.call(strip, "copy", tile, "-to", index * tile.width(), 0)
+    for shot in shots:
+        shot.unlink()
+    strip.write(str(docs / "preview-badge.png"), format="png")
+    print(f"wrote {docs / 'preview-badge.png'}  ({strip.width()}x{strip.height()})")
 
 
 if __name__ == "__main__":

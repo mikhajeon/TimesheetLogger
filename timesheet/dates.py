@@ -38,6 +38,50 @@ def week_dates(week_start: ISODate, include_weekend: bool) -> list[ISODate]:
     return [add_days(week_start, i) for i in range(7 if include_weekend else 5)]
 
 
+def start_of_month(value: ISODate) -> ISODate:
+    return from_iso(value).replace(day=1).isoformat()
+
+
+def add_months(value: ISODate, months: int) -> ISODate:
+    """``value``'s month shifted by ``months``, landing on the 1st — the
+    Month tab only ever navigates whole months, never a specific day."""
+    date = from_iso(value)
+    index = date.month - 1 + months
+    year = date.year + index // 12
+    month = index % 12 + 1
+    return date.replace(year=year, month=month, day=1).isoformat()
+
+
+def month_label(value: ISODate) -> str:
+    """``October 2026``."""
+    return from_iso(value).strftime("%B %Y")
+
+
+def is_same_month(value: ISODate, month_start: ISODate) -> bool:
+    a, b = from_iso(value), from_iso(month_start)
+    return a.year == b.year and a.month == b.month
+
+
+def month_weeks(value: ISODate) -> list[list[ISODate]]:
+    """Full Monday-start weeks covering the month containing ``value``.
+
+    Always seven days wide regardless of ``show_weekend`` — the Month tab is
+    a calendar grid, not a work-week one — with the spillover from the month
+    before and after filled in so every row is a complete week.
+    """
+    first = from_iso(start_of_month(value))
+    grid_start = first - dt.timedelta(days=first.weekday())
+    last_of_month = from_iso(add_months(value, 1)) - dt.timedelta(days=1)
+    grid_end = last_of_month + dt.timedelta(days=6 - last_of_month.weekday())
+
+    weeks = []
+    cursor = grid_start
+    while cursor <= grid_end:
+        weeks.append([to_iso(cursor + dt.timedelta(days=i)) for i in range(7)])
+        cursor += dt.timedelta(days=7)
+    return weeks
+
+
 def iso_week_number(value: ISODate) -> int:
     return from_iso(value).isocalendar().week
 

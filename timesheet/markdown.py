@@ -1,7 +1,8 @@
-"""Builds the Markdown export that Cursor turns into customer timesheet notes.
+"""Builds the Markdown file saved to ``exports/`` as a record of the period.
 
-The export is organised the way a timesheet note is actually written: a table of
-bookable lines first, then the narrative grouped per K-code.
+The file is organised the way a timesheet note is actually written: a table of
+bookable lines first, then the narrative grouped per K-code. Day-to-day keying
+in happens off the Export tab's table rather than this.
 """
 
 from __future__ import annotations
@@ -9,6 +10,9 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 
+from .bookings import Line
+from .bookings import collect as bookings_for
+from .bookings import planned_on
 from .dates import (
     ISODate,
     format_minutes,
@@ -18,13 +22,6 @@ from .dates import (
     to_decimal_hours,
 )
 from .models import Database
-
-
-@dataclass
-class _LineItem:
-    title: str
-    minutes: int = 0
-    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -39,52 +36,42 @@ class _Booking:
     billable: bool
     exact_minutes: int = 0
     rounded_minutes: int = 0
-    items: list[_LineItem] = field(default_factory=list)
+    items: list[Line] = field(default_factory=list)
 
 
 def _collect(db: Database, dates: list[ISODate]) -> list[_Booking]:
-    in_range = set(dates)
+    """Gathers the per-task lines into the K-code lines the export is written in.
+
+    Rounding happens on the booking rather than on its tasks, so the figures
+    here add up to what gets keyed in even when the parts wouldn't.
+    """
     bookings: dict[tuple, _Booking] = {}
 
-    for entry in db.entries:
-        if entry.date not in in_range:
-            continue
-        task = db.task(entry.task_id)
-        if task is None:
-            continue
-        project = db.project(task.project_id)
-        if project is None:
-            continue
-        client = db.client(project.client_id)
-
-        key = (project.id, task.billable, entry.date)
+    for line in bookings_for(db, dates):
+        key = (line.project_id, line.billable, line.date)
         booking = bookings.get(key)
         if booking is None:
             booking = _Booking(
-                date=entry.date,
-                client_name=client.name if client else "Unknown client",
-                is_internal=client.is_internal if client else False,
-                project_name=project.name,
-                k_code=project.k_code,
-                billable=task.billable,
+                date=line.date,
+                client_name=line.client_name,
+                is_internal=line.is_internal,
+                project_name=line.project_name,
+                k_code=line.k_code,
+                billable=line.billable,
             )
             bookings[key] = booking
 
-        booking.exact_minutes += entry.minutes
-        item = next((i for i in booking.items if i.title == task.title), None)
-        if item is None:
-            item = _LineItem(title=task.title)
-            booking.items.append(item)
-        item.minutes += entry.minutes
-        if entry.note.strip():
-            item.notes.append(entry.note.strip())
+        booking.exact_minutes += line.minutes
+        booking.items.append(line)
 
-    increment = db.settings.rounding_minutes
+    # Always exact — the export never rounds what's keyed in, only the Day
+    # tab's duration pickers (``Settings.entry_increment_minutes``) offer a
+    # step other than one minute. ``rounded_minutes`` is kept as the field
+    # name used below rather than renamed, but it's exact minutes now.
     for booking in bookings.values():
-        booking.rounded_minutes = round_minutes(booking.exact_minutes, increment)
+        booking.rounded_minutes = round_minutes(booking.exact_minutes, 0)
 
-    # Anything that rounds away to nothing is dropped; the exact-minutes footer
-    # at the end of the export is what makes those crumbs visible.
+    # A booking with nothing on it is dropped rather than shown as 0h.
     return sorted(
         (b for b in bookings.values() if b.rounded_minutes > 0),
         key=lambda b: (b.date, b.is_internal, b.client_name, b.k_code),
@@ -93,19 +80,13 @@ def _collect(db: Database, dates: list[ISODate]) -> list[_Booking]:
 
 def build_markdown(db: Database, dates: list[ISODate], title: str) -> str:
     bookings = _collect(db, dates)
-    rounding = db.settings.rounding_minutes
-    rounding_label = (
-        f"rounded to the nearest {rounding} min" if rounding else "exact minutes"
-    )
 
-    in_range = set(dates)
-    total_exact = sum(e.minutes for e in db.entries if e.date in in_range)
     total_rounded = sum(b.rounded_minutes for b in bookings)
     billable_rounded = sum(b.rounded_minutes for b in bookings if b.billable)
 
     out: list[str] = [f"# {title}", ""]
     out.append(
-        f"_Generated {dt.datetime.now():%d %b %Y %H:%M} · {rounding_label} · "
+        f"_Generated {dt.datetime.now():%d %b %Y %H:%M} · "
         f"{format_minutes(total_rounded)} total, {format_minutes(billable_rounded)} billable_"
     )
     out.append("")
@@ -148,7 +129,7 @@ def build_markdown(db: Database, dates: list[ISODate], title: str) -> str:
         for b in group:
             out.append(f"- **{pretty_date(b.date)}** — {format_minutes(b.rounded_minutes)}")
             for item in sorted(b.items, key=lambda i: -i.minutes):
-                out.append(f"  - {item.title} ({format_minutes(item.minutes)})")
+                out.append(f"  - {item.display_title} ({format_minutes(item.minutes)})")
                 for note in item.notes:
                     out.append(f"    - {note}")
         out.append("")
@@ -159,7 +140,7 @@ def build_markdown(db: Database, dates: list[ISODate], title: str) -> str:
     out.append("| Day | Planned | Actual | Delta |")
     out.append("| --- | --- | --- | --- |")
     for date in dates:
-        planned = sum(p.minutes for p in db.plans if p.date == date)
+        planned = planned_on(db, date)
         actual = sum(e.minutes for e in db.entries if e.date == date)
         if not planned and not actual:
             continue
@@ -180,6 +161,4 @@ def build_markdown(db: Database, dates: list[ISODate], title: str) -> str:
             out.append(f"- **{pretty_date(date)}**: {db.day_notes[date].strip()}")
         out.append("")
 
-    out.append(f"_Exact tracked time before rounding: {format_minutes(total_exact)}._")
-    out.append("")
     return "\n".join(out)

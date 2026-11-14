@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build and attach assets to (e.g. v0.1.0)
+        description: Existing release tag to attach assets to (e.g. v0.1.0). Built from main, not from the tag.
         required: true
 
 permissions:
@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag && 'main' || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

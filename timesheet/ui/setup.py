@@ -368,6 +368,7 @@ class SetupView:
         self._launch_vars = {}
         for location, caption, note in (
             ("desktop", "Desktop shortcut", "An icon to start it from"),
+            ("startmenu", "Start menu shortcut", "Lists it in Start, where it can be pinned"),
             ("startup", "Start when I sign in", "Runs hidden, waiting in the tray"),
         ):
             variable = tk.BooleanVar(value=launcher.exists(location))

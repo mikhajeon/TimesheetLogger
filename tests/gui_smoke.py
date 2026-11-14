@@ -1037,7 +1037,7 @@ def main() -> int:
     # Writing a .lnk goes through PowerShell, so it either works end to end
     # or not at all. Skipped if one is already there, rather than replacing
     # a shortcut the machine's owner put on their own desktop.
-    for location in ("desktop", "startup"):
+    for location in ("desktop", "startmenu", "startup"):
         link = launcher.shortcut_path(location)
         assert link is not None, f"Windows did not report the {location} folder"
         if link.exists():

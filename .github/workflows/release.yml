@@ -1,0 +1,47 @@
+name: Release assets
+
+# Builds the two downloads and attaches them to the GitHub release for a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach assets to (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  assets:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the tag matches __version__
+        shell: bash
+        run: |
+          version=$(python -c "import timesheet; print(timesheet.__version__)")
+          test "v$version" = "$TAG" || { echo "tag $TAG != __version__ $version"; exit 1; }
+      - name: Build zip and exe
+        shell: bash
+        run: |
+          python -m pip install pyinstaller
+          python scripts/build_release.py
+      - name: Checksums
+        shell: bash
+        working-directory: dist
+        run: sha256sum TimesheetLogger-* > SHA256SUMS.txt
+      - name: Attach to the release
+        shell: bash
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/TimesheetLogger-* dist/SHA256SUMS.txt --clobber

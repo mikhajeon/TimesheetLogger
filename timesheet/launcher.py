@@ -1,4 +1,4 @@
-"""Desktop and sign-in shortcuts.
+"""Desktop, Start menu and sign-in shortcuts.
 
 A ``.lnk`` is a COM object, not a file format worth hand-rolling, so these are
 written through ``WScript.Shell`` — the scripting host that ships with
@@ -50,6 +50,15 @@ def claim_app_identity() -> None:
 #: rather than assumed to be ``~/Desktop``, because OneDrive moves it.
 FOLDERID_DESKTOP = "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"
 FOLDERID_STARTUP = "{B97D20BB-F46A-4C97-BA10-5E3608430854}"
+#: Per-user Start menu "Programs" folder: whatever is in it appears in Start's
+#: app list, from where it can be pinned to Start or the taskbar.
+FOLDERID_PROGRAMS = "{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}"
+
+_FOLDERS = {
+    "desktop": FOLDERID_DESKTOP,
+    "startup": FOLDERID_STARTUP,
+    "startmenu": FOLDERID_PROGRAMS,
+}
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -80,8 +89,9 @@ def known_folder(folder_id: str) -> Path | None:
 
 
 def launcher() -> Path:
-    """The ``.pyw`` that starts the app without a console window."""
-    return paths.PROJECT_ROOT / "run.pyw"
+    """What a shortcut opens: the ``.pyw`` that starts the app without a console
+    window, or the executable itself in the packaged build."""
+    return Path(sys.executable) if paths.FROZEN else paths.PROJECT_ROOT / "run.pyw"
 
 
 def interpreter() -> Path:
@@ -91,6 +101,8 @@ def interpreter() -> Path:
     overlay is up, which rather defeats an overlay.
     """
     current = Path(sys.executable)
+    if paths.FROZEN:
+        return current
     quiet = current.with_name("pythonw.exe")
     return quiet if quiet.exists() else current
 
@@ -100,7 +112,7 @@ def icon() -> Path:
 
 
 def shortcut_path(location: str) -> Path | None:
-    folder = known_folder(FOLDERID_DESKTOP if location == "desktop" else FOLDERID_STARTUP)
+    folder = known_folder(_FOLDERS[location])
     return folder / f"{NAME}.lnk" if folder else None
 
 
@@ -122,7 +134,7 @@ def create(location: str) -> str:
         [
             "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:TS_LINK)",
             "$s.TargetPath = $env:TS_EXE",
-            '$s.Arguments = \'"\' + $env:TS_ARG + \'"\'',
+            *([] if paths.FROZEN else ['$s.Arguments = \'"\' + $env:TS_ARG + \'"\'']),
             "$s.WorkingDirectory = $env:TS_DIR",
             "$s.Description = 'Timesheet overlay'",
             *(["$s.IconLocation = $env:TS_ICON"] if art.exists() else []),
@@ -135,7 +147,7 @@ def create(location: str) -> str:
         "TS_LINK": str(link),
         "TS_EXE": str(interpreter()),
         "TS_ARG": str(launcher()),
-        "TS_DIR": str(paths.PROJECT_ROOT),
+        "TS_DIR": str(launcher().parent),
         "TS_ICON": str(art),
     }
     return _run(script, environment) or ("" if link.exists() else "the shortcut was not written")

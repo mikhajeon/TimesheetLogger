@@ -5,3 +5,5 @@ __pycache__/
 # Delete these two lines if you want your timesheet history version-controlled.
 data/
 exports/
+dist/
+build/

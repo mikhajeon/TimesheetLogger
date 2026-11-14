@@ -23,6 +23,23 @@ nothing to `pip install`.
 | --- | --- | --- | --- |
 | ![Setup tab](docs/preview-setup.png) | ![Recurring tab](docs/preview-recurring.png) | ![Preferences tab](docs/preview-preferences.png) | ![Export tab](docs/preview-export.png) |
 
+## Download
+
+Grab one of these from the [latest release](../../releases/latest) — no need to clone the repo.
+
+| File | For | Needs |
+| --- | --- | --- |
+| `TimesheetLogger-vX.Y.Z.zip` | Locked-down machines where unknown `.exe` files aren't allowed | Python 3.8+ with tkinter |
+| `TimesheetLogger-vX.Y.Z.exe` | Everyone else: double-click and go | Nothing |
+
+**Zip:** unzip anywhere, double-click `run.pyw`, then tick **Start menu shortcut** in the
+Preferences tab. Right-click it in Start to **Pin to Start** or the taskbar. Your data stays in
+the unzipped folder's `data/`, so copy that folder across when upgrading.
+
+**Exe:** the same tick works. Your data lives in `%LOCALAPPDATA%\Timesheet Logger`, so upgrading
+is just replacing the `.exe`. Windows may show a SmartScreen warning because the file is unsigned;
+`SHA256SUMS.txt` on the release lets you verify it.
+
 ## The loop it's built around
 
 1. **Set up** the task once in the Setup tab — client, project, K-code, task. The Day tab
@@ -123,6 +140,7 @@ first time.
 
 ![The Launching section of the Preferences tab](docs/launching.png)
 
+- **Start menu shortcut** lists it in Start's app list, from where it can be pinned.
 - **Desktop shortcut** puts `Timesheet Logger.lnk` on your desktop, pointing at `pythonw.exe`
   and `run.pyw` with the app icon on it.
 - **Start when I sign in** puts the same shortcut in your Startup folder. It opens silently

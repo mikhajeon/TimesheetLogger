@@ -3,17 +3,9 @@
 An always-on-top Windows overlay for planning your week, tracking time against client
 projects, and keying the result into your customer timesheet without retyping anything.
 
-```
-python run.py          # with a console, for development
-pythonw run.pyw        # silent launch, for daily use
-```
-
-Or tick **Desktop shortcut** in the Preferences tab and start it from there — see
-[Starting it](#starting-it).
-
-**No installation, no dependencies.** It runs on the Python standard library alone —
-`tkinter` for the UI, `ctypes` for the global hotkeys, `json` for storage. There is
-nothing to `pip install`.
+Set up clients, projects and tasks once, then plan and track each day with a timer or typed
+hours. Hours come out as the decimal figures timesheet systems ask for, one click from copying.
+Windows only, standard-library Python, data kept in a local JSON file.
 
 | Day | Week | Month |
 | --- | --- | --- |
@@ -23,22 +15,33 @@ nothing to `pip install`.
 | --- | --- | --- | --- |
 | ![Setup tab](docs/preview-setup.png) | ![Recurring tab](docs/preview-recurring.png) | ![Preferences tab](docs/preview-preferences.png) | ![Export tab](docs/preview-export.png) |
 
-## Download
+## Installation
 
-Grab one of these from the [latest release](../../releases/latest) — no need to clone the repo.
+Download from the [latest release](../../releases/latest). There is nothing to build or `pip install`.
 
-| File | For | Needs |
+| Option | Use when | Needs |
 | --- | --- | --- |
-| `TimesheetLogger-vX.Y.Z.zip` | Locked-down machines where unknown `.exe` files aren't allowed | Python 3.8+ with tkinter |
-| `TimesheetLogger-vX.Y.Z.exe` | Everyone else: double-click and go | Nothing |
+| **`.exe`** | You can run downloaded programs | Nothing |
+| **`.zip`** | Your company blocks unknown `.exe` files | Python 3.8+ with tkinter |
 
-**Zip:** unzip anywhere, double-click `run.pyw`, then tick **Start menu shortcut** in the
-Preferences tab. Right-click it in Start to **Pin to Start** or the taskbar. Your data stays in
-the unzipped folder's `data/`, so copy that folder across when upgrading.
+**Exe**
+1. Download `TimesheetLogger-vX.Y.Z.exe` and double-click it.
+2. Windows SmartScreen may warn because it is unsigned: **More info → Run anyway**
+   (compare against `SHA256SUMS.txt` if you want to verify it).
 
-**Exe:** the same tick works. Your data lives in `%LOCALAPPDATA%\Timesheet Logger`, so upgrading
-is just replacing the `.exe`. Windows may show a SmartScreen warning because the file is unsigned;
-`SHA256SUMS.txt` on the release lets you verify it.
+**Zip**
+1. Download `TimesheetLogger-vX.Y.Z.zip` and unzip it somewhere permanent.
+2. Double-click `run.pyw` (or `pythonw run.pyw`; use `python run.py` to see errors).
+
+**Then, for either**
+- Open the **Preferences** tab and tick **Start menu shortcut**, then right-click the app in Start
+  and choose **Pin to Start**. Also available: **Desktop shortcut** and **Start when I sign in**
+  (see [Starting it](#starting-it)).
+- Moving the unzipped folder breaks its shortcuts; untick and re-tick them.
+
+**Where your data lives:** the exe keeps it in `%LOCALAPPDATA%\Timesheet Logger`; the zip keeps it in
+the unzipped folder's `data/`. To upgrade, replace the exe, or unzip the new version over the old
+one (or copy `data/` across). Set `TIMESHEET_HOME` to store it elsewhere.
 
 ## The loop it's built around
 

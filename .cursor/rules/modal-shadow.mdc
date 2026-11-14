@@ -1,0 +1,24 @@
+---
+description: Box, wedge or light line showing around or behind the entry modal (dialog / shadow artefacts)
+alwaysApply: false
+---
+
+# Artefact around or behind the entry modal: check the shadow first
+
+A "box", light wedge or light line behind or around the entry modal was fixed
+(confirmed by the user) in `_sheet_shadow` in `timesheet/ui/today.py`, not in
+the widgets, the ghost windows or the scrim. Start there for similar reports.
+
+What it was:
+
+- The shadow shape is cast 2px downward. "Inside the dialog, skip it" was
+  decided with the shifted shape, leaving an unshadowed strip under the
+  dialog's bottom edge. Now the dialog's real outline decides, and the strip
+  gets full shadow.
+- Rows inside the dialog only looped over the side pads, so the four squares
+  just outside the rounded corners were never shaded (light wedges). The corner
+  columns are now included.
+
+Checking it: read the shadow's own pixels (`surface._backdrop(x, y, 1, 1)`
+against `_modal_backdrop`) at the corners and edges rather than capturing the
+window. `PrintWindow` does not capture the canvas-drawn parts of the dialog.

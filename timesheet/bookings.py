@@ -60,6 +60,25 @@ class Line:
         return NOTE_SEPARATOR.join(self.notes)
 
 
+def setup_order(db: Database) -> dict[str, int]:
+    """Each task's position in the Setup tab, top to bottom: clients, then
+    their projects, then a project's tasks with a task's sub-tasks right
+    beneath it — each level in the order it was arranged there."""
+    rank: dict[str, int] = {}
+    for client in db.clients:
+        for project in db.projects:
+            if project.client_id != client.id:
+                continue
+            for task in db.tasks:
+                if task.project_id != project.id or task.parent_id:
+                    continue
+                rank[task.id] = len(rank)
+                for child in db.tasks:
+                    if child.parent_id == task.id:
+                        rank[child.id] = len(rank)
+    return rank
+
+
 def collect(db: Database, dates: list[ISODate]) -> list[Line]:
     """Bookable lines for ``dates``, ordered the way they get keyed in.
 
@@ -116,9 +135,11 @@ def collect(db: Database, dates: list[ISODate]) -> list[Line]:
             seen_notes[key].add(note.casefold())
             line.notes.append(note)
 
+    # Within a day, in the order the Setup tab lists the tasks.
+    rank = setup_order(db)
     return sorted(
         lines.values(),
-        key=lambda l: (l.date, l.is_internal, l.client_name, l.k_code, l.task_title),
+        key=lambda l: (l.date, rank.get(l.task_id, len(rank)), l.client_name, l.k_code, l.task_title),
     )
 
 

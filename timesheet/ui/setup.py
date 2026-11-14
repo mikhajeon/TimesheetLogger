@@ -9,14 +9,31 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+from tkinter import colorchooser
 
 from .. import launcher, monitors, paths
-from ..dates import format_minutes
+from ..dates import format_duration
 from ..hotkeys import format_accelerator
 from ..store import Store
-from . import icons, theme
+from . import controls, icons, theme
 from .scroll import ScrollFrame
 from .overlay import DEFAULT_HOTKEYS
+
+#: Choices for how an hour figure reads on screen — never applied to what's
+#: exported or copied out, which always stays decimal (see
+#: ``dates.format_duration``).
+HOUR_FORMAT_CHOICES = {
+    "Clock (7h 30m)": "clock",
+    "Decimal (7.5)": "decimal",
+}
+
+#: Choices for how dates read on screen — see ``Settings.date_format``.
+DATE_FORMAT_CHOICES = {
+    "2026-11-13": "iso",
+    "13/11/2026": "dmy",
+    "11/13/2026": "mdy",
+    "13 Nov 2026": "text",
+}
 
 #: Choices for the duration pickers' own step — never applied to what's
 #: exported, which always stays exact (see ``timesheet.ui.export``).
@@ -24,6 +41,20 @@ INCREMENT_CHOICES = {
     "1 minute": 1,
     "5 minutes": 5,
     "6 minutes": 6,
+    "10 minutes": 10,
+    "15 minutes": 15,
+    "30 minutes": 30,
+}
+
+#: Choices for how long with no mouse/keyboard input auto-pauses a running
+#: timer — see ``Settings.idle_pause_minutes``. "5 minutes" (the default)
+#: is also listed first on purpose: it's what matches Microsoft Teams' own
+#: default "Away" threshold, the one most people already have some feel
+#: for.
+IDLE_PAUSE_CHOICES = {
+    "5 minutes": 5,
+    "1 minute": 1,
+    "2 minutes": 2,
     "10 minutes": 10,
     "15 minutes": 15,
     "30 minutes": 30,
@@ -64,6 +95,12 @@ class SetupView:
         self.scroll = ScrollFrame(self.frame)
         self.scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
+    def _fmt(self, minutes: float) -> str:
+        """An hour figure the way ``Settings.hour_format`` (the "Hour
+        format" row above) says to show it — see ``dates.format_duration``.
+        """
+        return format_duration(minutes, self.store.db.settings.hour_format == "decimal")
+
     def refresh(self) -> None:
         theme.commit_focused_entry(self.frame)
         self.scroll.clear()
@@ -85,96 +122,202 @@ class SetupView:
         return box
 
     def _preferences(self, parent: tk.Misc) -> None:
-        box = self._section(parent, "Preferences")
         settings = self.store.db.settings
 
-        row = theme.frame(box)
-        row.pack(fill="x", pady=2)
-        theme.label(row, "Theme", font=theme.FONT_SMALL).pack(side="left")
+        # -- Appearance ----------------------------------------------------
+        card = controls.section(parent, "Appearance")
         # "System" isn't one of ``theme.PALETTES`` — it's resolved against
         # Windows' own light/dark setting instead of naming a palette
         # directly — so it's added here rather than falling out of that dict.
         palettes = {name.title(): name for name in theme.PALETTES}
         palettes["System"] = theme.SYSTEM
-        palette = tk.StringVar(
-            value=next(k for k, v in palettes.items() if v == theme.MODE)
-        )
-        theme.option_menu(
-            row,
-            palette,
-            list(palettes),
-            command=lambda value: self.overlay.set_theme(palettes[value]),
-        ).pack(side="right")
+        current = next(k for k, v in palettes.items() if v == theme.MODE)
+        controls.Segmented(
+            card.row("Theme", "System follows Windows' light/dark setting"),
+            list(palettes), current,
+            lambda value: self.overlay.set_theme(palettes[value]),
+        ).pack()
 
-        row = theme.frame(box)
-        row.pack(fill="x", pady=2)
-        theme.label(row, "Duration picker step", font=theme.FONT_SMALL).pack(side="left")
-        current = next(
-            (k for k, v in INCREMENT_CHOICES.items() if v == settings.entry_increment_minutes),
-            "15 minutes",
-        )
-        increment = tk.StringVar(value=current)
-        theme.option_menu(
-            row,
-            increment,
+        percent = lambda v: f"{round(v * 100)}%"  # noqa: E731
+        controls.Slider(
+            card.row("Overlay opacity"), 0.3, 1.0, settings.opacity, 0.05,
+            self.overlay.set_opacity, fmt=percent,
+        ).pack()
+
+        self._color_row(card, "Actual progress color", "progress_bar_color", theme.ACCENT)
+        self._color_row(card, "Planned progress color", "planned_bar_color", theme.PLANNED)
+
+        # -- Window --------------------------------------------------------
+        card = controls.section(parent, "Window")
+        controls.Switch(
+            card.row("Always on top", "Stays above other windows, and won't collapse "
+                     "when you click away"),
+            settings.always_on_top, lambda _v: self.overlay.toggle_always_on_top(),
+        ).pack()
+        controls.Switch(
+            card.row("Pin while collapsed", "Keeps the badge above other windows"),
+            settings.pin_when_collapsed, self.overlay.set_pin_when_collapsed,
+        ).pack()
+
+        # -- Time and hours -----------------------------------------------
+        card = controls.section(parent, "Time and hours")
+        controls.Segmented(
+            card.row("Hour format"),
+            list(HOUR_FORMAT_CHOICES), self._label_for(
+                HOUR_FORMAT_CHOICES, settings.hour_format, "Clock (7h 30m)"
+            ),
+            lambda value: self.store.patch_settings(hour_format=HOUR_FORMAT_CHOICES[value]),
+        ).pack()
+        controls.Select(
+            card.row("Date format", "Dates shown in the app; exports and files keep ISO"),
+            list(DATE_FORMAT_CHOICES),
+            self._label_for(DATE_FORMAT_CHOICES, settings.date_format, "2026-11-13"),
+            lambda value: self.store.patch_settings(date_format=DATE_FORMAT_CHOICES[value]),
+        ).pack()
+        controls.Select(
+            card.row("Duration picker step"),
             list(INCREMENT_CHOICES),
-            command=lambda value: self.store.patch_settings(
+            self._label_for(INCREMENT_CHOICES, settings.entry_increment_minutes, "15 minutes"),
+            lambda value: self.store.patch_settings(
                 entry_increment_minutes=INCREMENT_CHOICES[value]
             ),
+        ).pack()
+        self._daily_target(card)
+        self._work_hours(card)
+
+        # -- Idle ----------------------------------------------------------
+        card = controls.section(parent, "Idle")
+        controls.Switch(
+            card.row("Pause when idle", "Pauses a running timer after a spell with no "
+                     "mouse or keyboard input"),
+            settings.idle_auto_pause,
+            lambda value: self.store.patch_settings(idle_auto_pause=value),
+        ).pack()
+        controls.Select(
+            card.row("Idle threshold"),
+            list(IDLE_PAUSE_CHOICES),
+            self._label_for(IDLE_PAUSE_CHOICES, settings.idle_pause_minutes, "5 minutes"),
+            lambda value: self.store.patch_settings(
+                idle_pause_minutes=IDLE_PAUSE_CHOICES[value]
+            ),
+        ).pack()
+
+    @staticmethod
+    def _label_for(choices: dict, value, fallback: str) -> str:
+        return next((k for k, v in choices.items() if v == value), fallback)
+
+    def _daily_target(self, card: controls.Card) -> None:
+        settings = self.store.db.settings
+        step = max(1, settings.entry_increment_minutes)
+        minutes = sorted({*range(step, 16 * 60 + 1, step), settings.daily_target_minutes})
+        labels = {self._fmt(m): m for m in minutes}
+        controls.Select(
+            card.row("Daily target"),
+            list(labels), self._fmt(settings.daily_target_minutes),
+            lambda value: self._commit_target(labels[value]),
+        ).pack()
+
+    def _color_row(self, card: controls.Card, caption: str, attr: str, fallback: str) -> None:
+        """A swatch that opens the colour chooser and (only while there's a
+        custom colour to undo) a Reset button."""
+        current = getattr(self.store.db.settings, attr)
+        holder = card.row(caption)
+        if current:
+            controls.action(
+                holder, "Reset", lambda: self.store.patch_settings(**{attr: ""})
+            ).pack(side="right", padx=(8, 0))
+        controls.Swatch(
+            holder, current or fallback, lambda: self._pick_color(attr, caption, fallback)
         ).pack(side="right")
 
-        row = theme.frame(box)
-        row.pack(fill="x", pady=2)
-        theme.label(
-            row,
-            f"Daily target ({format_minutes(settings.daily_target_minutes)})",
-            font=theme.FONT_SMALL,
-        ).pack(side="left")
-        theme.duration_picker(
-            row, settings.daily_target_minutes, self._commit_target,
-            max_minutes=16 * 60, width=7, font=theme.FONT_SMALL,
-            step=settings.entry_increment_minutes,
-        ).pack(side="right")
-
-        row = theme.frame(box)
-        row.pack(fill="x", pady=2)
-        theme.label(row, "Overlay opacity", font=theme.FONT_SMALL).pack(side="left")
-        percent = theme.label(
-            row, f"{round(settings.opacity * 100)}%", fg=theme.MUTED, font=theme.FONT_TINY
+    def _pick_color(self, attr: str, title: str, fallback: str) -> None:
+        # ``askcolor`` returns ``(None, None)`` on Cancel — nothing to patch.
+        _rgb, hex_colour = colorchooser.askcolor(
+            color=getattr(self.store.db.settings, attr) or fallback, title=title
         )
+        if hex_colour:
+            self.store.patch_settings(**{attr: hex_colour})
 
-        def on_opacity(value: str) -> None:
-            self.overlay.set_opacity(float(value))
-            percent.config(text=f"{round(float(value) * 100)}%")
+    # -- work hours -----------------------------------------------------
 
-        opacity = tk.Scale(
-            row,
-            from_=0.3,
-            to=1.0,
-            resolution=0.05,
-            orient="horizontal",
-            showvalue=False,
-            length=130,
-            bg=theme.BG_HOVER,  # this is the slider handle; must contrast the trough
-            fg=theme.TEXT,
-            troughcolor=theme.BG_INPUT,
-            activebackground=theme.ACCENT,
-            highlightthickness=0,
-            bd=0,
-            sliderrelief="flat",
-            command=on_opacity,
+    def _work_hours(self, card: controls.Card) -> None:
+        settings = self.store.db.settings
+        self._time_pair(
+            card, ("Work day starts", "Work day ends"),
+            "work_start_minutes", "work_end_minutes", min_gap=30,
         )
-        opacity.set(settings.opacity)
-        opacity.pack(side="right")
-        percent.pack(side="right", padx=4)
+        holder = card.row("Work day", "Default is 9:00 to 5:00 (24-hour clock here)")
+        controls.action(
+            holder, "Default", lambda: self.store.patch_settings(
+                work_start_minutes=9 * 60, work_end_minutes=17 * 60
+            ),
+        ).pack()
 
-        # Held on the instance because Tk keeps only a weak reference to the
-        # variable; a local would be collected and the box would render empty.
-        self._pinned = tk.BooleanVar(value=settings.always_on_top)
-        theme.checkbox(
-            box, "Always on top", self._pinned, self.overlay.toggle_always_on_top
-        ).pack(fill="x", pady=2)
+        controls.Switch(
+            card.row("Skip lunch on the progress bar"),
+            settings.lunch_enabled,
+            lambda value: self.store.patch_settings(lunch_enabled=value),
+        ).pack()
+        if settings.lunch_enabled:
+            self._time_pair(
+                card, ("Lunch starts", "Lunch ends"),
+                "lunch_start_minutes", "lunch_end_minutes", min_gap=5,
+            )
 
+    def _time_pair(
+        self, card: controls.Card, captions: tuple[str, str], start_attr: str, end_attr: str,
+        *, min_gap: int,
+    ) -> None:
+        """Two hour:minute pickers (a start and an end) that never let the
+        range collapse below ``min_gap`` minutes."""
+        settings = self.store.db.settings
+        for caption, attr in zip(captions, (start_attr, end_attr)):
+            holder = card.row(caption)
+            value = getattr(settings, attr)
+            minute_values = sorted({*range(0, 60, 5), value % 60})
+            hour = tk.StringVar(value=f"{value // 60:02d}")
+            minute = tk.StringVar(value=f"{value % 60:02d}")
+
+            def commit(_v=None, a=attr, h=hour, m=minute) -> None:
+                self._commit_time_pair(
+                    start_attr, end_attr, min_gap, a, int(h.get()) * 60 + int(m.get())
+                )
+
+            def chosen(variable: tk.StringVar):
+                def on_choose(value: str) -> None:
+                    variable.set(value)
+                    commit()
+                return on_choose
+
+            # Packed right-to-left: minutes, ":", hours.
+            controls.Select(
+                holder, [f"{m:02d}" for m in minute_values], minute.get(), chosen(minute)
+            ).pack(side="right")
+            theme.label(
+                holder, ":", bg=theme.BG_RAISED, font=theme.FONT_SMALL
+            ).pack(side="right", padx=3)
+            controls.Select(
+                holder, [f"{h:02d}" for h in range(24)], hour.get(), chosen(hour)
+            ).pack(side="right")
+
+    def _commit_time_pair(
+        self, start_attr: str, end_attr: str, min_gap: int, attr: str, minutes: int
+    ) -> None:
+        """Saves one end of a range, nudging the other to keep ``min_gap``."""
+        settings = self.store.db.settings
+        start, end = getattr(settings, start_attr), getattr(settings, end_attr)
+        last = 24 * 60 - 1
+        if attr == start_attr:
+            start = minutes
+            if end < start + min_gap:
+                end = min(start + min_gap, last)
+                start = min(start, end - min_gap)
+        else:
+            end = minutes
+            if start > end - min_gap:
+                start = max(end - min_gap, 0)
+                end = max(end, start + min_gap)
+        self.store.patch_settings(**{start_attr: start, end_attr: end})
     def _position(self, parent: tk.Misc) -> None:
         box = self._section(parent, "Screen position")
         settings = self.store.db.settings

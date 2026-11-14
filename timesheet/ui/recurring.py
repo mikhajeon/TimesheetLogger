@@ -42,6 +42,14 @@ class RecurringView:
         self._expanded: set[str] = set()
         #: Note ids armed for delete, waiting on a second click.
         self._confirm_delete: set[str] = set()
+        #: Drag state for the handle on each row — see ``_drag_start``.
+        #: Each entry is ``(note_id, widget, heading)``; a note can only
+        #: land next to a sibling sharing its own ``heading`` (its task),
+        #: a drag can't be used to relocate a note onto a different task.
+        self._row_widgets: list[tuple[str, tk.Widget, str]] = []
+        self._drag_id: str | None = None
+        self._drag_heading: str | None = None
+        self._drop_indicator: tk.Frame | None = None
 
         self._build_header()
         self.scroll = ScrollFrame(self.frame)
@@ -58,6 +66,7 @@ class RecurringView:
     def refresh(self) -> None:
         theme.commit_focused_entry(self.frame)
         self.scroll.clear()
+        self._row_widgets = []
         body = self.scroll.body
         notes = self.store.all_recurring_notes(include_archived=self._show_archived.get())
 
@@ -75,7 +84,7 @@ class RecurringView:
                     fill="x", pady=(10, 3)
                 )
                 for note in group:
-                    self._note_row(body, note)
+                    self._note_row(body, note, heading)
 
         self._add_panel(body)
 
@@ -100,9 +109,27 @@ class RecurringView:
 
     # -- rows -----------------------------------------------------------
 
-    def _note_row(self, parent: tk.Misc, note: RecurringNote) -> None:
-        row = theme.frame(parent)
+    def _note_row(self, parent: tk.Misc, note: RecurringNote, heading: str) -> None:
+        row = theme.frame(parent, highlightthickness=0)
+        theme.round_corners(row, 6, border=theme.BG)
+        if note.id == self._drag_id:
+            # Same recipe as the Day tab's own dragged-row highlight (see
+            # ``TodayView._day_row``) — picked up here instead of waiting
+            # on a redraw, since nothing else is going to repaint it until
+            # the drag actually lands (``_drag_end``).
+            theme.set_border(row, theme.ACCENT, 2)
+        else:
+            theme.set_border(row, theme.BG, 1)
         row.pack(fill="x", pady=1)
+        self._row_widgets.append((note.id, row, heading))
+
+        handle = theme.grip(row)
+        handle.pack(side="left", padx=(0, 4))
+        handle.bind(
+            "<ButtonPress-1>", lambda e, nid=note.id, h=heading: self._drag_start(nid, h, e)
+        )
+        handle.bind("<B1-Motion>", self._drag_motion)
+        handle.bind("<ButtonRelease-1>", self._drag_end)
 
         text = theme.entry(row, font=theme.FONT_SMALL)
         text.insert(0, note.note)
@@ -302,3 +329,85 @@ class RecurringView:
         self._confirm_delete.discard(note_id)
         self._expanded.discard(note_id)
         self.refresh()
+
+    # -- drag-reorder -------------------------------------------------------
+    #
+    # Same recipe as the Day tab's own manual-order drag (see
+    # ``TodayView._drag_start`` et al.) — this just moves the note within
+    # ``db.recurring_notes`` itself (``Store.move_recurring_note``) rather
+    # than one date's own saved ``day_order``, since this is the *default*
+    # every day without a drag of its own falls back to, not any one day's
+    # override.
+
+    def _drag_start(self, note_id: str, heading: str, event: tk.Event) -> None:
+        self._drag_id = note_id
+        self._drag_heading = heading
+        widget = self._row_widget(note_id)
+        if widget is not None:
+            theme.set_border(widget, theme.ACCENT, 2)
+
+    def _drag_motion(self, event: tk.Event) -> None:
+        if self._drag_id is None:
+            return
+        others = [
+            (nid, widget) for nid, widget, heading in self._row_widgets
+            if nid != self._drag_id and heading == self._drag_heading and widget.winfo_exists()
+        ]
+        if not others:
+            self._hide_drop_indicator()
+            return
+        parent = others[0][1].master
+        target = self._drop_target(self._drag_id, self._drag_heading, event.y_root)
+        if target is not None:
+            edge = next(widget for nid, widget in others if nid == target)
+            y = edge.winfo_rooty() - parent.winfo_rooty() - 2
+        else:
+            last = others[-1][1]
+            y = last.winfo_rooty() + last.winfo_height() - parent.winfo_rooty()
+        self._show_drop_indicator(parent, y)
+
+    def _drag_end(self, event: tk.Event) -> None:
+        dragged = self._drag_id
+        heading = self._drag_heading
+        self._drag_id = None
+        self._drag_heading = None
+        self._hide_drop_indicator()
+        if dragged is not None:
+            # Computed before the state above is cleared — ``_drop_target``
+            # needs ``dragged``/``heading`` as they were during the drag,
+            # not whatever they've just been reset to.
+            target = self._drop_target(dragged, heading, event.y_root)
+            self.store.move_recurring_note(dragged, target)
+        self.refresh()
+
+    def _row_widget(self, note_id: str) -> tk.Widget | None:
+        return next(
+            (w for nid, w, _h in self._row_widgets if nid == note_id and w.winfo_exists()), None
+        )
+
+    def _drop_target(self, dragged: str, heading: str | None, y_root: int) -> str | None:
+        """Same idea as the Day tab's own ``_drop_target`` — the sibling to
+        land in front of, restricted to whichever shares the dragged note's
+        own heading (its task); ``None`` lands at that group's own end."""
+        for note_id, widget, row_heading in self._row_widgets:
+            if note_id == dragged or row_heading != heading:
+                continue
+            if not widget.winfo_exists():
+                continue
+            if y_root <= widget.winfo_rooty() + widget.winfo_height() // 2:
+                return note_id
+        return None
+
+    def _show_drop_indicator(self, parent: tk.Misc, y: int) -> None:
+        if self._drop_indicator is None or not self._drop_indicator.winfo_exists():
+            self._drop_indicator = tk.Frame(
+                parent, bg=theme.blend(theme.ACCENT, theme.BG, 0.3),
+                height=4, highlightthickness=0, bd=0,
+            )
+        self._drop_indicator.place(x=0, y=y, relwidth=1.0)
+        self._drop_indicator.lift()
+
+    def _hide_drop_indicator(self) -> None:
+        if self._drop_indicator is not None and self._drop_indicator.winfo_exists():
+            self._drop_indicator.destroy()
+        self._drop_indicator = None

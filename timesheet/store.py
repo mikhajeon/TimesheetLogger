@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from . import bookings, recurrence
-from .dates import ISODate, to_iso
+from . import recurrence
+from .dates import ISODate, set_date_format, to_iso
 from .models import (
     ActiveTimer,
     Client,
@@ -34,10 +34,10 @@ import datetime as dt
 
 
 #: ``Settings.day_grouping`` values the Day tab's view-mode selector offers.
-DAY_GROUPINGS = ("manual", "project", "phase", "task")
+DAY_GROUPINGS = ("manual", "customer", "project", "phase", "task")
 
 
-@dataclass(frozen=True)
+@dataclass
 class DayRow:
     """One line on the Day tab.
 
@@ -45,6 +45,16 @@ class DayRow:
     for a task that's relevant to the day but hasn't had anything logged
     against it yet — a placeholder standing in for its ``Plan``. This id is
     what Manual grouping's drag order is keyed on.
+
+    Not frozen: every widget a Day tab row builds for itself closes over
+    this same instance and reads ``entry`` fresh at click time rather than
+    a value captured when the row was built (see ``TodayView._day_row``),
+    so promoting a placeholder — the first nudge or field commit that logs
+    a real ``Entry`` against it — only has to set ``entry`` here in place
+    (``TodayView._promote_row``) for every one of those to start treating
+    it as logged from then on, with nothing about the row torn down and
+    rebuilt to get there. Nothing else ever mutates one of these; a fresh
+    batch is still built from scratch on every real ``day_rows`` call.
     """
 
     id: str
@@ -97,7 +107,7 @@ class TaskContext:
 
     @property
     def heading(self) -> str:
-        return f"{self.client.name} · {self.project.name} ({self.project.k_code})"
+        return f"{self.client.name}: [{self.project.k_code}] {self.project.name}"
 
     @property
     def phase_title(self) -> str:
@@ -195,6 +205,10 @@ class Store:
             listener()
 
     def load(self) -> None:
+        self._load()
+        set_date_format(self.db.settings.date_format)
+
+    def _load(self) -> None:
         # However it goes below, this is a different document from whatever
         # was open a moment ago — Undo reaching back into it would land
         # somewhere the user never asked to go.
@@ -249,6 +263,19 @@ class Store:
 
     def can_redo(self) -> bool:
         return bool(self._redo_stack)
+
+    def history_depth(self) -> int:
+        """How many undo steps exist right now.
+
+        ``_tracked`` only pushes one when a mutator actually changed
+        something (see its own docstring), so comparing this before and
+        after a call is a cheap way to tell "exactly one tracked change
+        happened" apart from "nothing changed" or "more than one did" —
+        without a caller having to compare full snapshots itself. See
+        ``TodayView``'s own light-refresh guard, the one thing here that
+        needs it.
+        """
+        return len(self._undo_stack)
 
     def undo(self) -> None:
         if not self._undo_stack:
@@ -649,6 +676,78 @@ class Store:
             item.minutes = max(0, rule.minutes)
         self._changed()
 
+    # -- setup order ---------------------------------------------------------
+    #
+    # The Setup tab lists clients, a client's projects, a project's tasks and
+    # a task's sub-tasks in the order of their own lists (``db.clients`` and
+    # so on), so arranging them there is just moving an item within its
+    # siblings: before ``before_id``, or last among them for ``None``.
+
+    def _move_sibling(self, items: list, item, before_id: str | None, same_group) -> None:
+        if item is None or item.id == before_id:
+            return
+        siblings = [i for i in items if i is not item and same_group(i)]
+        before = next((s for s in siblings if s.id == before_id), None) if before_id else None
+        was = [i.id for i in items]
+        items.remove(item)
+        if before is not None:
+            items.insert(items.index(before), item)
+        elif siblings:
+            items.insert(items.index(siblings[-1]) + 1, item)
+        else:
+            items.append(item)
+        if [i.id for i in items] != was:  # dropped where it already was: nothing to save
+            self._changed()
+
+    @_tracked
+    def move_client(self, client_id: str, before_id: str | None) -> None:
+        item = self.db.client(client_id)
+        self._move_sibling(self.db.clients, item, before_id, lambda _c: True)
+
+    @_tracked
+    def move_project(self, project_id: str, before_id: str | None) -> None:
+        item = self.db.project(project_id)
+        if item is not None:
+            self._move_sibling(
+                self.db.projects, item, before_id, lambda p: p.client_id == item.client_id
+            )
+
+    @_tracked
+    def move_task(self, task_id: str, before_id: str | None) -> None:
+        item = self.db.task(task_id)
+        if item is not None:
+            self._move_sibling(
+                self.db.tasks, item, before_id,
+                lambda t: t.project_id == item.project_id and t.parent_id == item.parent_id,
+            )
+
+    @_tracked
+    def move_recurring_note(self, note_id: str, before_id: str | None) -> None:
+        """Reorders ``note_id`` within ``db.recurring_notes`` itself, to sit
+        right before ``before_id`` (or at the very end, for ``None``) —
+        this list's own order is the only thing that decides a note's
+        natural position, both here in the Recurring tab (see
+        ``RecurringView``'s drag handle) and as the default a day without
+        its own saved ``day_order`` for that row falls back to (see
+        ``day_rows``/``recurring_notes_due``). A day that *has* dragged its
+        own order for a date keeps that, per date, regardless of this —
+        this only moves the fallback every other day (and any day not yet
+        dragged) still uses.
+        """
+        notes = self.db.recurring_notes
+        item = next((n for n in notes if n.id == note_id), None)
+        if item is None or note_id == before_id:
+            return
+        notes.remove(item)
+        if before_id is not None:
+            target = next((n for n in notes if n.id == before_id), None)
+            if target is not None:
+                notes.insert(notes.index(target), item)
+                self._changed()
+                return
+        notes.append(item)
+        self._changed()
+
     @_tracked
     def delete_recurring_note(self, note_id: str) -> None:
         """Removes a recurring note outright.
@@ -722,26 +821,57 @@ class Store:
     @_tracked
     def add_entry(
         self, task_id: str, date: ISODate, minutes: int, note: str = "",
-        recurring_note_id: str = "", internal_note: str = "",
+        recurring_note_id: str = "", internal_note: str = "", plan_minutes: int = 0,
+        clear_plan: bool = False,
     ) -> Entry | None:
         """Logs a new entry. ``minutes`` of exactly 0 is a deliberate,
         allowed value — "+ log another entry" starts one that way, left for
         its own Actual Hours picker to fill in rather than guessing a
         duration for it — only negative is rejected outright.
 
+        ``plan_minutes`` carries over whatever the row it's replacing was
+        already showing for Planned Hours — a recurring note's own "usual"
+        minutes, say (see ``Store.day_rows``) — so logging the first figure
+        against a placeholder doesn't reset Planned Hours to "Unset" out
+        from under whatever it already read. 0 ("Unset") by default for the
+        one caller ("+ log another entry") that's adding a brand new entry
+        with nothing of its own to carry forward.
+
         Returns the new ``Entry`` (``None`` on the rejected-negative no-op)
         so a caller — "+ log another entry" wanting to focus its note field,
         say — can single it out after the refresh it triggers, rather than
         guessing which of possibly several same-task entries just appeared.
+
+        ``clear_plan`` is for one specific caller — the Day tab promoting
+        its own bare-``Plan`` placeholder straight into this entry (see
+        ``TodayView._nudge``/``_commit_row_minutes``) — not a general rule
+        for every new entry: a ``Plan`` set deliberately, independent of
+        any one entry, is a standing goal for the day (``planned_minutes``
+        keeps reporting it regardless of what's actually logged, by
+        design — see ``test_plan_track_and_reload``), not something
+        logging time should ever quietly erase out from under it. The one
+        placeholder's own bare Plan is different: nothing set it on
+        purpose as a goal distinct from "what this row is about to show
+        once something's logged against it" — it's the same figure this
+        call already carries into the new entry's own ``plan_minutes``,
+        not independent of it — so leaving it in place here is otherwise
+        inert (``day_rows`` never falls back to it once any entry exists)
+        right up until every entry against it is deleted, at which point
+        it silently puts a fresh placeholder straight back, reading as if
+        deleting the last one had done nothing.
         """
         if minutes < 0:
             return None
         entry = Entry(
             task_id=task_id, date=date, minutes=minutes, note=note,
             source="manual", recurring_note_id=recurring_note_id,
-            internal_note=internal_note,
+            internal_note=internal_note, plan_minutes=plan_minutes,
         )
         self.db.entries.append(entry)
+        if clear_plan:
+            self.db.plans = [
+                p for p in self.db.plans if not (p.task_id == task_id and p.date == date)
+            ]
         self._changed()
         return entry
 
@@ -764,7 +894,8 @@ class Store:
     def adjust_entry(
         self, task_id: str, date: ISODate, delta_minutes: int,
         note: str = "", recurring_note_id: str = "", internal_note: str = "",
-    ) -> None:
+        plan_minutes: int = 0, clear_plan: bool = False,
+    ) -> Entry | None:
         """Used by the +/- buttons; tops up one manual entry rather than
         littering the day with a separate entry per click.
 
@@ -772,9 +903,19 @@ class Store:
         placeholder) so nudging one recurring note due today never tops up
         a different one, or a plain entry, that happens to share the task.
 
+        ``plan_minutes`` and ``clear_plan`` are only used the first time,
+        for the same reason ``add_entry`` takes them — see there.
+
         Floors at zero rather than removing the entry — see
         ``adjust_entry_minutes``, which this mirrors once something exists
         to nudge.
+
+        Returns whichever ``Entry`` the day ends up with — topped up, newly
+        created, or ``None`` for the no-op of a negative nudge landing on
+        a placeholder with nothing yet to take from — mirroring
+        ``add_entry``'s own return, for the same reason: a caller promoting
+        a placeholder (the Day tab's own ``_nudge``) needs it back to patch
+        the row in place rather than rebuild it from scratch.
         """
         on_day = [
             e for e in self.db.entries
@@ -787,11 +928,15 @@ class Store:
 
         if existing is None:
             if delta_minutes > 0:
-                self.add_entry(task_id, date, delta_minutes, note, recurring_note_id, internal_note)
-            return
+                return self.add_entry(
+                    task_id, date, delta_minutes, note, recurring_note_id, internal_note,
+                    plan_minutes, clear_plan,
+                )
+            return None
 
         existing.minutes = max(0, existing.minutes + delta_minutes)
         self._changed()
+        return existing
 
     @_tracked
     def update_entry(self, entry_id: str, **changes) -> None:
@@ -822,11 +967,18 @@ class Store:
     # -- the timer ----------------------------------------------------------
 
     @_tracked
-    def start_timer(self, task_id: str, note: str = "", recurring_note_id: str = "") -> None:
+    def start_timer(
+        self, task_id: str, note: str = "", recurring_note_id: str = "", entry_id: str = "",
+    ) -> None:
+        """``entry_id`` is set when this timer is picked up on a row that
+        already has its own logged ``Entry`` — see ``ActiveTimer.entry_id``
+        and ``stop_timer``, which is what actually acts on it."""
         if self.db.active_timer:
             self.stop_timer()
+        now = time.time()
         self.db.active_timer = ActiveTimer(
-            task_id=task_id, started_at=time.time(), note=note, recurring_note_id=recurring_note_id
+            task_id=task_id, started_at=now, day_anchor=now, note=note,
+            recurring_note_id=recurring_note_id, entry_id=entry_id,
         )
         self._changed()
 
@@ -836,16 +988,137 @@ class Store:
             self.save()
 
     @_tracked
+    def pause_timer(self, *, auto: bool = False) -> None:
+        """Banks whatever the current running segment has accrued and stops
+        the clock, without finishing the timer outright — ``stop_timer``'s
+        own job, with an entry to show for it. ``resume_timer`` picks back
+        up from here rather than restarting from zero.
+
+        ``auto=True`` is idle detection (see ``timesheet.idle``) pausing this
+        on the user's behalf, tagged as such (``ActiveTimer.auto_paused`` so
+        only *this* kind of pause ever lifts itself back up once activity
+        returns — a pause the user chose stays paused until they choose to
+        resume it themselves."""
+        timer = self.db.active_timer
+        if timer is None or timer.paused:
+            return
+        timer.elapsed_before += max(0.0, time.time() - timer.started_at)
+        timer.paused = True
+        timer.auto_paused = auto
+        self._changed()
+
+    @_tracked
+    def resume_timer(self) -> None:
+        timer = self.db.active_timer
+        if timer is None or not timer.paused:
+            return
+        timer.started_at = time.time()
+        timer.paused = False
+        timer.auto_paused = False
+        self._changed()
+
+    def _rounded_timer_minutes(self, timer: ActiveTimer) -> int:
+        """What ``timer`` would actually bank if stopped right now —
+        rounded to the duration pickers' own step (Preferences \u2192
+        "Duration picker step", ``Settings.entry_increment_minutes``), not
+        to the nearest whole minute — so a timer's own entry always lands
+        on a figure the Actual Hours picker could have produced itself,
+        the same as every other way of logging time already does.
+
+        Shared between ``stop_timer`` (what actually gets banked) and
+        ``timer_preview`` (what the timer bar shows *would* get banked) so
+        the two can never quietly disagree — a preview that doesn't match
+        what Stop then actually does would be worse than no preview at
+        all. The *live* readout while it's still running (the timer bar's
+        own clock, the collapsed badge) stays exact to the second
+        regardless — only this, what Stop itself would commit, ever
+        rounds.
+        """
+        step = max(1, self.db.settings.entry_increment_minutes)
+        return round(timer.elapsed_seconds / 60 / step) * step
+
+    def _timer_entry_base(self, timer: ActiveTimer) -> int:
+        """The entry ``timer`` was started on, in minutes — ``0`` for a
+        placeholder that hadn't been logged yet (``entry_id`` blank) or
+        one that's since been deleted while the timer ran. Shared by
+        ``timer_preview`` and ``timer_live_minutes``, which only differ in
+        whether what gets added to this is rounded or exact.
+        """
+        if not timer.entry_id:
+            return 0
+        entry = next((e for e in self.db.entries if e.id == timer.entry_id), None)
+        return entry.minutes if entry is not None else 0
+
+    def timer_preview(self) -> tuple[int, int] | None:
+        """``(minutes_to_add, new_total)`` for the running timer, if any —
+        what pressing Stop right now would actually add to its row, and
+        what that row's own total would become once it does (see
+        ``_rounded_timer_minutes`` for the rounding either figure is
+        built from). ``None`` with nothing running for a caller to show
+        in its place.
+
+        ``new_total`` is the specific entry's own total (``entry_id``,
+        same row ``_top_up_timed_entry`` would act on) when the timer
+        started on one that already existed, or just ``minutes_to_add``
+        itself for a placeholder still waiting on its first entry —
+        there's nothing of its own yet to add it to.
+        """
+        timer = self.db.active_timer
+        if timer is None:
+            return None
+        add = self._rounded_timer_minutes(timer)
+        return add, self._timer_entry_base(timer) + add
+
+    def timer_plan_minutes(self) -> int:
+        """This row's own Planned Hours, in minutes — ``0`` for a
+        placeholder (``entry_id`` blank), an entry with nothing set for
+        Planned Hours, or nothing running at all.
+
+        For the timer bar's own live readout to show against, when
+        there's something to show it against (see ``Overlay._tick``'s own
+        ``timer_preview`` label) — a bare ``0`` doesn't read as "no plan
+        set" there any better than it would on the Day tab's own Planned
+        Hours picker, so a caller checks this is truthy before using it
+        rather than this returning ``None`` for "nothing to show".
+        """
+        timer = self.db.active_timer
+        if timer is None or not timer.entry_id:
+            return 0
+        entry = next((e for e in self.db.entries if e.id == timer.entry_id), None)
+        return entry.plan_minutes if entry is not None else 0
+
+    def timer_live_minutes(self) -> float | None:
+        """The running timer's row's exact, unrounded running total right
+        now — this row's own base (see ``_timer_entry_base``) plus the
+        timer's exact elapsed time (``ActiveTimer.elapsed_seconds``),
+        never rounded to the duration pickers' own step the way
+        ``timer_preview`` is. ``None`` with nothing running.
+
+        For the timer bar's own live comparison beside its "what Stop
+        would actually bank" preview — the Day tab's own Actual Hours
+        slot shows this row's last-committed total instead, frozen, while
+        the timer's running on it (see ``timesheet.ui.today``'s own
+        ``_day_row``), rather than ticking in step with this.
+        """
+        timer = self.db.active_timer
+        if timer is None:
+            return None
+        return self._timer_entry_base(timer) + timer.elapsed_seconds / 60
+
+    @_tracked
     def stop_timer(self) -> None:
         timer = self.db.active_timer
         if timer is None:
             return
-        minutes = round((time.time() - timer.started_at) / 60)
+        minutes = self._rounded_timer_minutes(timer)
         self.db.active_timer = None
         if minutes >= 1:
+            if timer.entry_id and self._top_up_timed_entry(timer, minutes):
+                self._changed()
+                return
             # The entry belongs to the day the timer started on, not the day it
             # happened to be stopped on.
-            started = dt.date.fromtimestamp(timer.started_at)
+            started = dt.date.fromtimestamp(timer.day_anchor)
             template = (
                 self.db.recurring_note(timer.recurring_note_id)
                 if timer.recurring_note_id else None
@@ -862,6 +1135,23 @@ class Store:
                 )
             )
         self._changed()
+
+    def _top_up_timed_entry(self, timer: ActiveTimer, minutes: int) -> bool:
+        """Adds a stopped timer's accrued minutes onto the existing
+        ``Entry`` it was started on (``ActiveTimer.entry_id``) rather than a
+        fresh one alongside it — the same "top up, don't duplicate" rule
+        the +/- chips already follow for a placeholder's first nudge.
+
+        Returns whether the entry was still there to top up — gone (deleted
+        while the timer ran, say) falls back to a brand new one instead of
+        silently losing the time."""
+        entry = next((e for e in self.db.entries if e.id == timer.entry_id), None)
+        if entry is None:
+            return False
+        entry.minutes += minutes
+        if timer.note:
+            entry.note = timer.note
+        return True
 
     @_tracked
     def discard_timer(self) -> None:
@@ -891,17 +1181,27 @@ class Store:
         self.db.day_notes[date] = text
         self._changed()
 
-    def patch_settings(self, **changes) -> None:
+    def patch_settings(self, *, notify: bool = True, **changes) -> None:
         # Only notify on a real change. Tk widgets fire their callback when you
         # set their initial value, which would otherwise rebuild the view that
         # is still being built.
+        #
+        # ``notify=False`` is for settings that are pure window chrome (pinned
+        # on top, badge geometry) and have no bearing on what a tab renders —
+        # still persisted, but skipping ``_changed()`` means the active view
+        # doesn't tear itself down and rebuild over something it was never
+        # showing in the first place.
         touched = False
         for key, value in changes.items():
             if getattr(self.db.settings, key) != value:
                 setattr(self.db.settings, key, value)
                 touched = True
         if touched:
-            self._changed()
+            set_date_format(self.db.settings.date_format)
+            if notify:
+                self._changed()
+            else:
+                self.save()
 
     # -- queries -------------------------------------------------------------
 
@@ -954,8 +1254,60 @@ class Store:
         return sum(n.minutes for n in self.recurring_notes_due(task_id, date))
 
     def planned_minutes_on(self, date: ISODate) -> int:
-        """Everything set aside for a day, pinned plans and repeats together."""
-        return bookings.planned_on(self.db, date)
+        """Everything set aside for a day — summed straight off :meth:`day_rows`
+        itself, each row's own ``plan_minutes``, rather than re-deriving it
+        from pinned ``Plan``s and recurring notes directly (what this used
+        to do, and all ``bookings.planned_on`` still covers).
+
+        Those two agree only for a task with no ``Entry`` logged yet today;
+        once one exists, ``day_rows`` gives its row that entry's own
+        ``plan_minutes`` instead (see its docstring), independent of every
+        other entry the same task has that day — a day-level Plan's minutes
+        stop meaning anything at that point. Re-deriving it here the old
+        way would silently drop every such per-entry figure from this
+        total, which is exactly what fed the Day tab's own progress bar
+        showing none of it as planned (yellow) at all.
+        """
+        return sum(row.plan_minutes for row in self.day_rows(date))
+
+    def unfinished_planned_minutes_on(self, date: ISODate) -> int:
+        """What's still left to do, for the Day tab's own progress bar —
+        not the same figure as :meth:`planned_minutes_on`, which is the
+        day's whole planned workload regardless of how much of it any
+        given row has already covered.
+
+        Each row nets its own Planned Hours against its own actual
+        minutes (0 for a placeholder with nothing logged yet) and floors
+        at zero — logging 3h actual against a 4h-planned entry leaves 1h
+        still outstanding; logging 4h or more against it leaves none, not
+        a negative figure that would cancel out some other row's own
+        unfinished planned time it has nothing to do with. Summed across
+        every row on the day, same as ``planned_minutes_on``.
+
+        The progress bar stacks this right after actual, rather than
+        measuring it from zero the way a plain "planned" figure would —
+        two entries, one logged well past its own plan and one not
+        started, read as one bar with actual first and only the second
+        one's own shortfall after it, not as if the first's overrun plan
+        still had to be shown too.
+        """
+        total = 0
+        for row in self.day_rows(date):
+            actual = row.entry.minutes if row.entry else 0
+            total += max(0, row.plan_minutes - actual)
+        return total
+
+    def unfinished_planned_by_task(self, date: ISODate) -> dict[str, int]:
+        """:meth:`unfinished_planned_minutes_on`, split per task: each
+        task's rows net their own Planned Hours against their own actual
+        minutes and floor at zero, so an entry whose actual has matched or
+        passed its plan contributes nothing."""
+        result: dict[str, int] = {}
+        for row in self.day_rows(date):
+            actual = row.entry.minutes if row.entry else 0
+            task_id = row.context.task.id
+            result[task_id] = result.get(task_id, 0) + max(0, row.plan_minutes - actual)
+        return result
 
     def entries_for(self, task_id: str, date: ISODate) -> list[Entry]:
         return [e for e in self.db.entries if e.task_id == task_id and e.date == date]
@@ -973,6 +1325,38 @@ class Store:
                 billable += entry.minutes
         return total, billable
 
+    def totals_by_day(self, first: ISODate, last: ISODate) -> dict[ISODate, tuple[int, int]]:
+        """``{date: (total, billable)}`` minutes for every day from ``first``
+        to ``last`` (inclusive) that has any time — one pass over the
+        entries, for the quarter and year reports, where asking
+        :meth:`day_totals` for each of a few hundred days would rescan them
+        all every time."""
+        billable_task: dict[str, bool] = {}
+        days: dict[ISODate, list[int]] = {}
+        for entry in self.db.entries:
+            if not first <= entry.date <= last:
+                continue
+            if entry.task_id not in billable_task:
+                task = self.db.task(entry.task_id)
+                context = self.context(task) if task else None
+                billable_task[entry.task_id] = bool(context and context.billable)
+            totals = days.setdefault(entry.date, [0, 0])
+            totals[0] += entry.minutes
+            if billable_task[entry.task_id]:
+                totals[1] += entry.minutes
+        return {date: (t[0], t[1]) for date, t in days.items()}
+
+    def minutes_by_task(self, first: ISODate, last: ISODate) -> dict[ISODate, dict[str, int]]:
+        """``{date: {task_id: minutes}}`` for every day from ``first`` to
+        ``last`` (inclusive) with time on it — one pass, for the Month tab's
+        hover details and customer breakdown."""
+        days: dict[ISODate, dict[str, int]] = {}
+        for entry in self.db.entries:
+            if first <= entry.date <= last and entry.minutes:
+                tasks = days.setdefault(entry.date, {})
+                tasks[entry.task_id] = tasks.get(entry.task_id, 0) + entry.minutes
+        return days
+
     def range_totals(self, dates: list[ISODate]) -> tuple[int, int]:
         totals = [self.day_totals(d) for d in dates]
         return sum(t[0] for t in totals), sum(t[1] for t in totals)
@@ -983,7 +1367,7 @@ class Store:
         relevant |= {e.task_id for e in self.db.entries if e.date == date}
         relevant |= self.tasks_with_notes_due([date])
         timer = self.db.active_timer
-        if timer and to_iso(dt.date.fromtimestamp(timer.started_at)) == date:
+        if timer and to_iso(dt.date.fromtimestamp(timer.day_anchor)) == date:
             relevant.add(timer.task_id)
         return [c for c in self.active_contexts() if c.task.id in relevant]
 
@@ -1017,15 +1401,32 @@ class Store:
             )
             entries = self.entries_for(task_id, date)
 
-            pending_notes: list[RecurringNote] = []
-            if plan is None:
-                logged = {e.recurring_note_id for e in entries if e.recurring_note_id}
-                pending_notes = [
-                    n for n in self.recurring_notes_due(task_id, date) if n.id not in logged
-                ]
+            # Notes actually due today, in the Recurring tab's own order
+            # (``db.recurring_notes``'s list order — see
+            # ``recurring_notes_due`` and ``move_recurring_note``), each
+            # paired with its own logged ``Entry`` if one already exists.
+            # Logging against one of several notes due the same day must
+            # not leapfrog it ahead of its still-pending siblings into an
+            # "entries first" block the way a flat entries-then-notes split
+            # would — the row the user just touched is expected to stay
+            # roughly where it was, not jump to the top of the task's list.
+            due_notes = self.recurring_notes_due(task_id, date) if plan is None else []
+            entries_by_note = {
+                e.recurring_note_id: e for e in entries if e.recurring_note_id
+            }
+            due_note_ids = {n.id for n in due_notes}
+            # Everything else: ordinary manual entries, and any leftover
+            # entry whose own note isn't due today any more (recurrence
+            # changed, note archived/deleted) — never dropped, just kept in
+            # their existing relative order ahead of the recurring block,
+            # same as this always put every entry first.
+            other_entries = [
+                e for e in entries
+                if not (e.recurring_note_id and e.recurring_note_id in due_note_ids)
+            ]
 
             produced = False
-            for index, entry in enumerate(entries):
+            for index, entry in enumerate(other_entries):
                 rows.append(
                     DayRow(
                         id=entry.id, context=context, entry=entry,
@@ -1037,15 +1438,25 @@ class Store:
                 )
                 produced = True
 
-            for index, note in enumerate(pending_notes):
-                rows.append(
-                    DayRow(
-                        id=f"note:{note.id}", context=context, entry=None,
-                        is_first_for_task=not produced and index == 0,
-                        plan_note=note.note, plan_minutes=note.minutes,
-                        recurring_note_id=note.id, plan_internal_note=note.internal_note,
+            for note in due_notes:
+                entry = entries_by_note.get(note.id)
+                if entry is not None:
+                    rows.append(
+                        DayRow(
+                            id=entry.id, context=context, entry=entry,
+                            is_first_for_task=not produced,
+                            plan_minutes=entry.plan_minutes,
+                        )
                     )
-                )
+                else:
+                    rows.append(
+                        DayRow(
+                            id=f"note:{note.id}", context=context, entry=None,
+                            is_first_for_task=not produced,
+                            plan_note=note.note, plan_minutes=note.minutes,
+                            recurring_note_id=note.id, plan_internal_note=note.internal_note,
+                        )
+                    )
                 produced = True
 
             if not produced:
@@ -1076,11 +1487,14 @@ class Store:
             return [("", rows)]
 
         def key_for(row: DayRow) -> str:
+            ctx = row.context
+            if mode == "customer":
+                return ctx.client.name
             if mode == "project":
-                return row.context.heading
+                return ctx.heading
             if mode == "phase":
-                return f"{row.context.heading} \u2014 {row.context.phase_title or row.context.task.title}"
-            return f"{row.context.heading} \u2014 {row.context.display_title}"
+                return f"{ctx.heading} | {ctx.phase_title or ctx.task.title}"
+            return f"{ctx.heading} | {ctx.task.title}"
 
         groups: dict[str, list[DayRow]] = {}
         for row in rows:
@@ -1088,10 +1502,12 @@ class Store:
         return list(groups.items())
 
     def live_minutes(self, task_id: str, date: ISODate) -> float:
-        """Minutes the running timer has accrued for this task today, if any."""
+        """Minutes the running timer has accrued for this task today, if
+        any — correct whether it's currently running or paused (see
+        ``ActiveTimer.elapsed_seconds``)."""
         timer = self.db.active_timer
         if not timer or timer.task_id != task_id:
             return 0.0
-        if to_iso(dt.date.fromtimestamp(timer.started_at)) != date:
+        if to_iso(dt.date.fromtimestamp(timer.day_anchor)) != date:
             return 0.0
-        return max(0.0, (time.time() - timer.started_at) / 60)
+        return timer.elapsed_seconds / 60

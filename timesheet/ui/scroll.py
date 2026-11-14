@@ -89,6 +89,78 @@ class ScrollFrame(tk.Frame):
         for child in self.body.winfo_children():
             child.destroy()
 
+    # -- block-level refresh ------------------------------------------------
+    #
+    # ``clear`` + rebuild repaints the whole list on every change. Reconciling
+    # instead keeps each block (a card, a heading, a panel) alive while its
+    # ``signature`` is unchanged and rebuilds only the ones that differ, so a
+    # change redraws just the block it touched and nothing else flickers.
+
+    def begin_blocks(self) -> None:
+        """Starts a reconcile pass: blocks asked for from here to
+        ``end_blocks`` are matched against those of the previous pass."""
+        self._pending_offset = None  # nothing is torn down, so nothing jumps
+        leftover = getattr(self, "_previous", {})
+        self._previous = getattr(self, "_blocks", {})
+        if leftover:
+            # The last pass was abandoned part-way (see ``yielding``): what
+            # it never got to is still on screen, and still wanted for a
+            # match — keys can't clash, it had only popped the ones it used.
+            self._previous = {**leftover, **self._previous}
+        self._blocks: dict = {}
+        self._sequence: list[tk.Misc] = []
+        self._occurrences: dict = {}
+
+    def block(self, kind: str, label, signature, build) -> list[tk.Misc]:
+        """One block, identified by ``kind`` + ``label`` (+ how many times
+        that pair has already come up this pass). Reused as it is when its
+        ``signature`` matches last pass's; otherwise the old widgets are
+        destroyed and ``build()`` is called to create new ones (packing
+        into :attr:`body`). Returns the block's top-level widgets."""
+        count = self._occurrences.get((kind, label), 0)
+        self._occurrences[(kind, label)] = count + 1
+        key = (kind, label, count)
+        old = self._previous.pop(key, None)
+        if old is not None and old[0] == signature and all(w.winfo_exists() for w in old[1]):
+            widgets = old[1]
+        else:
+            if old is not None:
+                for widget in old[1]:
+                    widget.destroy()
+            before = set(self.body.winfo_children())
+            try:
+                build()
+            except BaseException:
+                # Abandoned part-way (see ``yielding``): no half-made block
+                # is left behind, untracked.
+                for widget in self.body.winfo_children():
+                    if widget not in before:
+                        widget.destroy()
+                raise
+            widgets = [w for w in self.body.winfo_children() if w not in before]
+        self._blocks[key] = (signature, widgets)
+        self._sequence.extend(widgets)
+        return widgets
+
+    def end_blocks(self) -> None:
+        """Ends the pass: drops blocks that weren't asked for, and puts the
+        survivors in order — reordering in place (``pack_configure``) rather
+        than forgetting and re-packing, so nothing is unmapped on the way."""
+        for _signature, widgets in self._previous.values():
+            for widget in widgets:
+                widget.destroy()
+        self._previous = {}
+        order = [w for w in self._sequence if w.winfo_exists()]
+        current = list(self.body.pack_slaves())
+        if current != order and order:
+            if current and current[0] is not order[0]:
+                order[0].pack_configure(before=current[0])
+            for previous, widget in zip(order, order[1:]):
+                widget.pack_configure(after=previous)
+
+    def block_order(self) -> list:
+        """The live top-level widgets of the last pass, in on-screen order."""
+        return [w for w in getattr(self, "_sequence", []) if w.winfo_exists()]
     def to_top(self) -> None:
         self._pending_offset = None  # an explicit jump outranks a restore
         self._canvas.yview_moveto(0)

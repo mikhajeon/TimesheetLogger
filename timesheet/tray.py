@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import queue
 import threading
+import time
 from ctypes import wintypes
 from pathlib import Path
 
@@ -32,6 +33,14 @@ WM_QUIT = 0x0012
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1  #: the icon reporting a click
 WM_REFRESH = WM_APP + 2  #: the UI thread asking for a redraw of tooltip/menu
+
+#: Broadcast by explorer.exe whenever it (re)starts — after a crash, an
+#: update, or because this app launched at logon before it had finished
+#: coming up. Every icon the old explorer knew about is gone when that
+#: happens; nothing short of adding it again brings it back, and nothing
+#: tells us to unless we ask Windows to relay this by name, since the
+#: message's numeric value isn't fixed across versions/sessions.
+WM_TASKBARCREATED = user32.RegisterWindowMessageW("TaskbarCreated")
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
@@ -88,6 +97,8 @@ user32.DefWindowProcW.argtypes = [
 user32.LoadImageW.restype = wintypes.HANDLE
 user32.LoadIconW.restype = wintypes.HICON
 user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wintypes.UINT
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.CreatePopupMenu.restype = wintypes.HMENU
 user32.TrackPopupMenu.argtypes = [
     wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int,
@@ -235,7 +246,18 @@ class TrayIcon:
             raise OSError("could not create the tray window")
 
         self._hicon = self._load_icon(instance)
-        if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data())):
+        # Launching at logon races explorer.exe's own startup — the add can
+        # fail simply because its notification host isn't listening yet.
+        # A few short retries covers that without the window staying open
+        # long enough for a user to notice the wait.
+        added = False
+        for attempt in range(5):
+            if attempt:
+                time.sleep(0.5)
+            if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data())):
+                added = True
+                break
+        if not added:
             raise OSError("the shell refused the tray icon")
 
     def _load_icon(self, instance: int):
@@ -277,6 +299,10 @@ class TrayIcon:
 
         if message == WM_REFRESH:
             shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._data(NIF_TIP)))
+            return 0
+
+        if message == WM_TASKBARCREATED:
+            shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data()))
             return 0
 
         if message == WM_DESTROY:

@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from timesheet import bookings, dwm, hotkeys, monitors, paths, recurrence, singleton
 from timesheet.dates import (
     add_months,
+    format_duration,
     format_minutes,
     is_same_month,
     month_label,
@@ -65,6 +66,19 @@ class DurationParsing(unittest.TestCase):
         self.assertEqual(format_minutes(45), "45m")
         self.assertEqual(format_minutes(60), "1h")
         self.assertEqual(format_minutes(450), "7h 30m")
+
+    def test_duration_defaults_to_clock_format(self) -> None:
+        self.assertEqual(format_duration(450), format_minutes(450))
+
+    def test_duration_decimal_matches_requested_examples(self) -> None:
+        # The figures named when this setting was asked for: 1.5, 7.5, 0.5.
+        self.assertEqual(format_duration(90, decimal=True), "1.5")
+        self.assertEqual(format_duration(450, decimal=True), "7.5")
+        self.assertEqual(format_duration(30, decimal=True), "0.5")
+        self.assertEqual(format_duration(0, decimal=True), "0")
+
+    def test_settings_hour_format_defaults_to_clock(self) -> None:
+        self.assertEqual(Settings().hour_format, "clock")
 
 
 class CornerSnapping(unittest.TestCase):
@@ -121,6 +135,31 @@ class StoreRoundTrip(unittest.TestCase):
         self.assertEqual(len(self.store.db.clients), 1)
         self.assertTrue(self.store.db.clients[0].is_internal)
         self.assertEqual(self.store.db.projects[0].k_code, "NCC")
+
+    def test_setup_order_drives_export_order(self) -> None:
+        zed = self.store.add_client("Zed")
+        alpha = self.store.add_client("Alpha")
+        pz = self.store.add_project(zed.id, "PZ", "K-9", True)
+        pa = self.store.add_project(alpha.id, "PA", "K-1", True)
+        t_zed = self.store.add_task(pz.id, "Zed task", True)
+        t_a1 = self.store.add_task(pa.id, "A1", True)
+        t_a2 = self.store.add_task(pa.id, "A2", True)
+        date = "2026-10-19"
+        for task in (t_a2, t_a1, t_zed):
+            self.store.add_entry(task.id, date, 30)
+
+        def exported() -> list[str]:
+            return [line.task_title for line in bookings.collect(self.store.db, [date])]
+
+        self.assertEqual(exported(), ["Zed task", "A1", "A2"])
+        self.store.move_task(t_a2.id, t_a1.id)
+        self.assertEqual(exported(), ["Zed task", "A2", "A1"])
+        self.store.move_task(t_a2.id, None)  # back to the end of its project
+        self.assertEqual(exported(), ["Zed task", "A1", "A2"])
+        self.store.move_client(alpha.id, zed.id)
+        self.assertEqual(exported(), ["A1", "A2", "Zed task"])
+        self.store.undo()
+        self.assertEqual(exported(), ["Zed task", "A1", "A2"])
 
     def test_plan_track_and_reload(self) -> None:
         client = self.store.add_client("Acme Ltd")
@@ -230,13 +269,16 @@ class StoreRoundTrip(unittest.TestCase):
 
         self.store.start_timer(task.id)
         self.assertIsNotNone(self.store.db.active_timer)
-        # Backdate so the timer has something worth banking.
+        # Backdate so the timer has something worth banking. Not a clean
+        # multiple of the default 15-minute step on purpose — stopping
+        # rounds to the nearest one (125 -> 120), the same step every other
+        # duration picker in the app is limited to.
         self.store.db.active_timer.started_at = time.time() - 125 * 60
         self.store.stop_timer()
 
         self.assertIsNone(self.store.db.active_timer)
         self.assertEqual(len(self.store.db.entries), 1)
-        self.assertEqual(self.store.db.entries[0].minutes, 125)
+        self.assertEqual(self.store.db.entries[0].minutes, 120)
         self.assertEqual(self.store.db.entries[0].source, "timer")
 
     def test_project_level_billable_gates_the_task(self) -> None:
@@ -1005,6 +1047,20 @@ class PerEntryPlannedHours(unittest.TestCase):
         self.assertTrue(row.is_placeholder)
         self.assertEqual(row.plan_minutes, 90)
 
+    def test_the_day_total_counts_each_entrys_own_plan_not_the_shared_one(self) -> None:
+        # The Day tab's own progress bar reads this for its yellow
+        # "planned" portion — it used to re-derive it from pinned Plans
+        # and recurring notes directly, which never sees a plan set on an
+        # entry that already exists (see ``Store.planned_minutes_on``).
+        self.store.update_entry(self.first.id, plan_minutes=45)
+        self.store.update_entry(self.second.id, plan_minutes=30)
+        self.assertEqual(self.store.planned_minutes_on(self.date), 75)
+
+        # A task+day Plan set after something's logged doesn't double up
+        # with the entries' own figures — it isn't read for them at all.
+        self.store.set_plan(self.task.id, self.date, 999)
+        self.assertEqual(self.store.planned_minutes_on(self.date), 75)
+
 
 class DayRowsAndGrouping(unittest.TestCase):
     """Row identity on the Day tab: one row per Entry, one placeholder per
@@ -1241,7 +1297,11 @@ class RecurringNotes(unittest.TestCase):
             self.task.id, "Daily stand-up", 30, self._weekday_rule([0, 1, 2, 3, 4], 30)
         )
         self.store.start_timer(self.task.id, note=note.note, recurring_note_id=note.id)
-        self.store.db.active_timer.started_at -= 60  # pretend a minute passed
+        # A clean multiple of the default 15-minute step: stopping rounds
+        # to it (see ``test_timer_banks_time_against_its_start_day`` for
+        # that on its own), and a minute here would round away to nothing,
+        # leaving no entry at all for this test to find.
+        self.store.db.active_timer.started_at -= 15 * 60
         self.store.stop_timer()
         entries = self.store.entries_for(self.task.id, self.store.db.entries[0].date)
         self.assertEqual(entries[0].recurring_note_id, note.id)
@@ -1274,7 +1334,10 @@ class RecurringNotes(unittest.TestCase):
         )
         self.store.update_recurring_note(note.id, internal_note="Keep it under 15 minutes")
         self.store.start_timer(self.task.id, note=note.note, recurring_note_id=note.id)
-        self.store.db.active_timer.started_at -= 60
+        # A clean multiple of the default 15-minute step — see the other
+        # timer test above for why a bare minute wouldn't leave an entry
+        # behind to even check.
+        self.store.db.active_timer.started_at -= 15 * 60
         self.store.stop_timer()
         entries = self.store.entries_for(self.task.id, self.store.db.entries[0].date)
         self.assertEqual(entries[0].internal_note, "Keep it under 15 minutes")

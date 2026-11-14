@@ -28,11 +28,13 @@ sys.path.insert(0, str(ROOT))
 
 from timesheet.ui.theme import PALETTES  # noqa: E402
 
-DEFAULT_DESIGN = (
-    r"C:\Users\mikha.jeon\OneDrive - Datacom\Documents"
-    r"\Design stuff for app building\Icons"
-)
-DESIGN = Path(os.environ.get("ICON_SOURCE", DEFAULT_DESIGN))
+# No machine-specific default: set ICON_SOURCE to your copy of the design folder.
+DESIGN = Path(os.environ.get("ICON_SOURCE") or ".")
+if not os.environ.get("ICON_SOURCE") and __name__ == "__main__":
+    raise SystemExit(
+        "Set ICON_SOURCE to your design icons folder first, e.g.\n"
+        "  $env:ICON_SOURCE = 'C:\\path\\to\\Icons'"
+    )
 #: Single-path line icons, recoloured per palette.
 SOURCE = DESIGN / "Functional Icons"
 #: Full-colour illustrations, used as drawn.
@@ -55,11 +57,6 @@ ICONS: dict[str, tuple[str, int, str]] = {
     "collapse": ("minus", 16, "MUTED"),
     "wide": ("arrows-left-right", 16, "MUTED"),
     "narrow": ("compress-wide", 16, "MUTED"),
-    # This icon set has no thumbtack. An anchor reads as "fixed in place" on
-    # its own merits, and holds up better at 16px than "bring-front"'s two
-    # overlapping squares did, which looked more like "duplicate window."
-    "pin": ("anchor", 16, "MUTED"),
-    "pin-on": ("anchor", 16, "ACCENT"),
     "undo": ("arrow-rotate-left", 14, "MUTED"),
     "redo": ("arrow-rotate-right", 14, "MUTED"),
     # Date navigation
@@ -73,11 +70,11 @@ ICONS: dict[str, tuple[str, int, str]] = {
     # Task rows
     "play": ("circle-play", 16, "TEXT"),
     "stop": ("circle-stop", 16, "ON_BILLABLE"),
-    # Sized for the large nudge/delete buttons in the Day tab's new left-hand
-    # actions column (see ``timesheet/ui/today.py``'s NUDGE_SIZE/DELETE_WIDTH)
-    # — bigger than most icons here since the button itself is too.
-    "plus": ("circle-plus", 20, "MUTED"),
-    "minus": ("circle-minus", 20, "MUTED"),
+    # The Day tab's +/- nudge chips (see ``timesheet/ui/today.py``'s
+    # NUDGE_SIZE) — smaller than the chip's own circle now that chip has
+    # shrunk too, rather than the glyph crowding the ring around it.
+    "plus": ("circle-plus", 15, "MUTED"),
+    "minus": ("circle-minus", 15, "MUTED"),
     # "delete" is the Day tab's own entry-delete chip in its inert state — a
     # trash can rather than an X, same glyph as the Setup/Recurring tabs'
     # two-click delete button ("trash" below) already use for the same
@@ -103,8 +100,8 @@ ICONS: dict[str, tuple[str, int, str]] = {
     "deny": ("circle-xmark", 14, "DANGER"),
     "trash": ("circle-trash", 14, "DANGER"),
     # The Export tab's week grid: a note's copy chip, muted when there's
-    # nothing on it to copy and accented once there is — same recipe as
-    # "pin"/"pin-on" above.
+    # nothing on it to copy and accented once there is — two tinted variants
+    # of the same glyph, swapped by state.
     "note": ("comment-lines", 14, "MUTED"),
     "note-filled": ("comment-lines", 14, "ACCENT"),
 }

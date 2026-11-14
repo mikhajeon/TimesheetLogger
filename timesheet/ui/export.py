@@ -7,9 +7,6 @@ clipboard, so filling in the customer timesheet is click, paste, click, paste.
 
 from __future__ import annotations
 
-import csv
-import datetime as dt
-import io
 import os
 import tkinter as tk
 import tkinter.font as tkfont
@@ -17,6 +14,7 @@ import tkinter.font as tkfont
 from .. import paths
 from ..bookings import Line, by_date
 from ..bookings import collect as collect_lines
+from ..bookings import setup_order
 from ..dates import (
     add_days,
     day_name,
@@ -30,20 +28,9 @@ from ..dates import (
     week_dates,
     week_label,
 )
-from ..markdown import build_markdown
 from ..store import Store
 from . import icons, theme
 from .scroll import ScrollFrame
-
-#: Header of Day mode's whole-table copy — one row per entry. Tabs, so it
-#: lands in Excel as a real grid.
-DAY_COLUMNS = ["Date", "Client", "Project", "K-code", "Task", "Hours", "Notes"]
-
-#: Week mode instead pivots to one row per task, hours filed under the day
-#: they were logged — the shape a customer timesheet's own weekly grid
-#: wants, so the whole table pastes straight into one rather than needing a
-#: pivot built around Day mode's per-entry rows first.
-WEEK_LABEL_COLUMNS = ["Customer : Project", "Task", "Time type"]
 
 #: Sizing for the week grid's columns, same recipe as the Week tab's own
 #: grid (``timesheet/ui/week.py``) — a day column's width is shared equally
@@ -121,29 +108,20 @@ class ExportView:
             size=theme.NAV_CHIP_SIZE, radius=10, font=theme.FONT_ICON,
         ).pack(side="left")
 
-        self.totals = theme.label(self.frame, "", fg=theme.MUTED, font=theme.FONT_SMALL)
-        self.totals.pack(fill="x", padx=8)
-
-        # Doubles as the hint, so confirming a copy doesn't shunt the table
-        # down by a row every time.
-        self.status = theme.label(self.frame, HINT, fg=theme.MUTED, font=theme.FONT_SMALL)
-        self.status.pack(fill="x", padx=8, pady=(2, 0))
-
+        # One row: the copy hint (and its confirmations) on the left, the
+        # hours summary on the right. The summary packs first so it keeps its
+        # room; the hint takes what is left. The hint doubles as the status
+        # line, so confirming a copy doesn't shunt the table down a row.
+        info = theme.frame(self.frame)
+        info.pack(fill="x", padx=8, pady=(0, 0))
+        self.totals = theme.label(info, "", fg=theme.MUTED, font=theme.FONT_SMALL, anchor="e")
+        self.totals.pack(side="right")
+        self.status = theme.label(
+            info, HINT, fg=theme.MUTED, font=theme.FONT_SMALL, anchor="w"
+        )
+        self.status.pack(side="left", fill="x", expand=True)
         self.table = ScrollFrame(self.frame)
         self.table.pack(fill="both", expand=True, padx=8, pady=4)
-
-        actions = theme.frame(self.frame)
-        actions.pack(fill="x", padx=8, pady=(0, 4))
-        theme.button(
-            actions,
-            "Copy whole table",
-            self._copy_table,
-            bg=theme.ACCENT,
-            fg=theme.ON_ACCENT,
-            hover=theme.ACCENT_HOVER,
-        ).pack(side="left")
-        theme.button(actions, "Save to exports/", self._save).pack(side="left", padx=4)
-        theme.button(actions, "Open as CSV", self._open_csv).pack(side="left")
 
         self.path_label = theme.button(
             self.frame,
@@ -222,7 +200,29 @@ class ExportView:
 
         self._draw()
 
+    _drawing = False
+    _redraw = False
+
     def _draw(self) -> None:
+        """Rebuilds the table. Building yields to Tk now and then (see
+        ``yielding``), which can deliver a resize and so ask for another draw
+        in the middle of this one; two builds clearing and filling the same
+        table at once leave it broken. So a request that arrives mid-build
+        just notes itself, and the build runs once more when this one ends."""
+        if self._drawing:
+            self._redraw = True
+            return
+        self._drawing = True
+        try:
+            while True:
+                self._redraw = False
+                self._draw_once()
+                if not self._redraw:
+                    break
+        finally:
+            self._drawing = False
+
+    def _draw_once(self) -> None:
         self.table.clear()
         body = self.table.body
 
@@ -283,6 +283,10 @@ class ExportView:
                     "by_date": {},
                 }
             row["by_date"][line.date] = line
+        # The Setup tab's own order, not the order tasks happened to turn
+        # up in (which would depend on which day each was first logged).
+        rank = setup_order(self.store.db)
+        order.sort(key=lambda task_id: rank.get(task_id, len(rank)))
         return [rows[task_id] for task_id in order]
 
     def _task_column_limit(self) -> int:
@@ -308,96 +312,201 @@ class ExportView:
         character = tkfont.Font(font=theme.FONT_SMALL).measure("n") or 6
         return max(GRID_TASK_CHARS_FLOOR, room // character)
 
+    @staticmethod
+    def _divider_column(slot: int) -> int:
+        """Grid column of the hairline in front of day ``slot`` (the Total
+        is slot ``len(dates)``). Every day owns two columns: the divider,
+        then its figure."""
+        return 2 * slot + 1
+
     def _draw_week_grid(self, body: tk.Misc) -> None:
+        """The week table, built like the Week tab's own grid: every day
+        (and the Total) is a divider column plus a figure column, and the
+        dividers are cells of the grid itself spanning every row, so they
+        stay put wherever the grid places the columns."""
         rounding = EXACT
         rows = self._week_rows()
         task_limit = self._task_column_limit()
+        days = len(self.dates)
+        total_slot = days
 
         grid = theme.frame(body)
         grid.pack(fill="both", expand=True)
 
-        theme.label(grid, "Customer : Project / Task", fg=theme.MUTED, font=theme.FONT_TINY).grid(
-            row=0, column=0, sticky="w"
+        # The header strip: its own darker band, today's column in the accent tint.
+        band = theme.header_fill()
+        theme.frame(grid, bg=band).grid(
+            row=0, column=0, columnspan=2 * (days + 1) + 1, sticky="nsew"
         )
-        for index, date in enumerate(self.dates):
-            cell = theme.frame(grid)
-            cell.grid(row=0, column=index + 1, padx=1, sticky="ew")
-            is_today = date == today()
-            theme.label(
-                cell, day_name(date), fg=theme.ACCENT if is_today else theme.TEXT,
-                font=theme.FONT_TINY, anchor="center",
-            ).pack()
-            theme.label(
-                cell, str(from_iso(date).day), fg=theme.MUTED, font=theme.FONT_TINY, anchor="center",
-            ).pack()
         theme.label(
-            grid, "Total", fg=theme.MUTED, font=theme.FONT_TINY, anchor="center"
-        ).grid(row=0, column=len(self.dates) + 1, padx=(4, 0), sticky="ew")
+            grid, "Customer : Project / Task", bg=band, fg=theme.MUTED,
+            font=theme.FONT_TINY_BOLD,
+        ).grid(row=0, column=0, sticky="nsw", padx=(4, 0))
+        for index, date in enumerate(self.dates):
+            is_today = date == today()
+            fill = theme.ACCENT_DIM if is_today else band
+            cell = theme.frame(grid, bg=fill)
+            cell.grid(
+                row=0, column=self._divider_column(index) + 1, padx=(2, 1), sticky="nsew"
+            )
+            theme.label(
+                cell, day_name(date), bg=fill, fg=theme.ACCENT if is_today else theme.TEXT,
+                font=theme.FONT_TINY_BOLD, anchor="center",
+            ).pack(pady=(3, 0))
+            theme.label(
+                cell, str(from_iso(date).day), bg=fill, fg=theme.MUTED,
+                font=theme.FONT_TINY, anchor="center",
+            ).pack(pady=(0, 3))
+        theme.label(
+            grid, "Total", bg=band, fg=theme.MUTED, font=theme.FONT_TINY_BOLD, anchor="center"
+        ).grid(
+            row=0, column=self._divider_column(total_slot) + 1, padx=(2, 1), sticky="nsew"
+        )
 
-        day_totals = [0] * len(self.dates)
+        day_totals = [0] * days
         grand_total = 0
-        for row_index, row in enumerate(rows, start=1):
-            self._task_info_cell(grid, row_index, row, task_limit)
+        for position, row in enumerate(rows):
+            # Two grid rows per task: the customer/project line on its own,
+            # then the task's row — title, figures and note chips together,
+            # so the copy buttons sit level with the task label.
+            row_index = 2 + 2 * position
+            # Same alternating bands as the Week tab: white, then a lighter
+            # grey than the page; every widget across both of the task's
+            # grid rows shares the fill, or its own background would show
+            # as a seam of the wrong shade.
+            # A task with nothing logged this period has no figures to
+            # frame, so it takes the page grey, like the Week tab's headers.
+            has_values = any(
+                line.rounded(rounding) for line in row["by_date"].values()
+            )
+            fill = theme.BG_RAISED if has_values else theme.BG
+            # From column 0, so the heading cell is white edge to edge, not
+            # only behind its text; the 1px gap under it is the row divider.
+            # The customer/project line is its own row on the page grey, shown
+            # once per group; the tasks under it sit on their own rows below.
+            heading_row = row_index - 1
+            new_group = position == 0 or rows[position - 1]['heading'] != row['heading']
+            if new_group:
+                theme.frame(grid, bg=theme.BG).grid(
+                    row=heading_row, column=0, columnspan=2 * (days + 1) + 1,
+                    sticky="nsew", pady=(0, 1),
+                )
+                theme.label(
+                    grid, theme.ellipsize(row['heading'], task_limit),
+                    bg=theme.BG, fg=theme.TEXT, font=theme.FONT_TINY_BOLD,
+                ).grid(row=heading_row, column=0, sticky="w", padx=(4, 0), pady=(4, 2))
+                # The group's rollup, faint, in the Total column.
+                group_minutes = sum(
+                    line.rounded(rounding)
+                    for other in rows if other["heading"] == row["heading"]
+                    for line in other["by_date"].values()
+                )
+                theme.label(
+                    grid,
+                    f"{to_decimal_hours(group_minutes):.2f}" if group_minutes else "\u2013",
+                    bg=theme.BG, fg=theme.MUTED, font=theme.FONT_TINY, anchor="center",
+                ).grid(
+                    row=heading_row, column=self._divider_column(total_slot) + 1,
+                    padx=(2, 1), pady=(4, 2), sticky="ew",
+                )
+            theme.frame(grid, bg=fill).grid(
+                row=row_index, column=0, columnspan=2 * (days + 1) + 1,
+                sticky="nsew", pady=(0, 1),
+            )
+            self._task_info_cell(grid, row_index, row, task_limit, fill)
             row_total = 0
-            for col_index, date in enumerate(self.dates):
+            for index, date in enumerate(self.dates):
                 line = row["by_date"].get(date)
-                cell = theme.frame(grid)
-                cell.grid(row=row_index, column=col_index + 1, padx=1, pady=1, sticky="ew")
+                cell = theme.frame(grid, bg=fill)
+                cell.grid(
+                    row=row_index, column=self._divider_column(index) + 1,
+                    padx=(2, 1), pady=1, sticky="ew",
+                )
                 if line is not None:
                     minutes = line.rounded(rounding)
                     row_total += minutes
-                    day_totals[col_index] += minutes
-                    self._day_cell(cell, line, rounding)
+                    day_totals[index] += minutes
+                    self._day_cell(cell, line, rounding, fill)
             grand_total += row_total
             theme.label(
                 grid,
                 f"{to_decimal_hours(row_total):.2f}" if row_total else "\u2013",
-                fg=theme.MUTED, font=theme.FONT_TINY, anchor="center",
-            ).grid(row=row_index, column=len(self.dates) + 1, padx=(4, 0), sticky="ew")
+                bg=fill, fg=theme.BILLABLE if row_total else theme.MUTED,
+                font=theme.FONT_TINY_BOLD, anchor="center",
+            ).grid(
+                row=row_index, column=self._divider_column(total_slot) + 1,
+                padx=(2, 1), sticky="ew",
+            )
 
-        footer = len(rows) + 1
-        theme.label(grid, "Total", font=theme.FONT_HEAD).grid(
+        # The totals row on the same tint the Week tab's footer uses.
+        footer = 2 * len(rows) + 1
+        foot = theme.blend(theme.PLANNED_BG, theme.BILLABLE_BG, 0.5)
+        theme.frame(grid, bg=foot).grid(
+            row=footer, column=0, columnspan=2 * (days + 1) + 1, sticky="nsew", pady=(8, 0)
+        )
+        theme.label(grid, "Total", bg=foot, font=theme.FONT_HEAD).grid(
             row=footer, column=0, sticky="w", pady=(8, 0)
         )
-        for col_index, total in enumerate(day_totals):
+        for index, total in enumerate(day_totals):
             theme.label(
                 grid,
                 f"{to_decimal_hours(total):.2f}" if total else "\u2013",
-                fg=theme.MUTED, font=theme.FONT_TINY, anchor="center",
-            ).grid(row=footer, column=col_index + 1, pady=(8, 0), sticky="ew")
+                bg=foot, fg=theme.BILLABLE if total else theme.MUTED,
+                font=theme.FONT_TINY_BOLD, anchor="center",
+            ).grid(
+                row=footer, column=self._divider_column(index) + 1,
+                padx=(2, 1), pady=(8, 0), sticky="ew",
+            )
         theme.label(
             grid,
             f"{to_decimal_hours(grand_total):.2f}" if grand_total else "\u2013",
-            font=theme.FONT_TINY, anchor="center",
-        ).grid(row=footer, column=len(self.dates) + 1, pady=(8, 0), padx=(4, 0), sticky="ew")
+            bg=foot, fg=theme.BILLABLE if grand_total else theme.MUTED,
+            font=theme.FONT_TINY_BOLD, anchor="center",
+        ).grid(
+            row=footer, column=self._divider_column(total_slot) + 1,
+            padx=(2, 1), pady=(8, 0), sticky="ew",
+        )
 
         grid.columnconfigure(0, weight=3, minsize=GRID_TASK_COLUMN)
-        for index in range(len(self.dates)):
-            grid.columnconfigure(index + 1, weight=1, uniform="day", minsize=GRID_DAY_COLUMN)
-        grid.columnconfigure(len(self.dates) + 1, minsize=GRID_TOTAL_COLUMN)
+        for slot in range(days):
+            column = self._divider_column(slot)
+            grid.columnconfigure(column, weight=0, minsize=1)
+            grid.columnconfigure(column + 1, weight=1, uniform="day", minsize=GRID_DAY_COLUMN)
+        total_column = self._divider_column(total_slot)
+        grid.columnconfigure(total_column, weight=0, minsize=1)
+        grid.columnconfigure(total_column + 1, minsize=GRID_TOTAL_COLUMN)
 
-    def _task_info_cell(self, grid: tk.Misc, row_index: int, row: dict, limit: int) -> None:
-        cell = theme.frame(grid)
-        cell.grid(row=row_index, column=0, sticky="w", pady=2)
+        # Last, once the row count is known: one hairline per day and the
+        # Total, each a grid cell of its own spanning every row.
+        for slot in range(days + 1):
+            tk.Frame(grid, bg=theme.LINE, width=1, bd=0, highlightthickness=0).grid(
+                row=0, column=self._divider_column(slot), rowspan=footer + 1, sticky="ns"
+            )
+
+    @staticmethod
+    def _stripe_grey() -> str:
+        """The second band: lighter than the page itself, so it reads as a
+        deliberate shade rather than vanishing into the background."""
+        return theme.blend(theme.BG, theme.BG_RAISED, 0.5)
+
+    def _task_info_cell(
+        self, grid: tk.Misc, row_index: int, row: dict, limit: int, fill: str
+    ) -> None:
+        title_row = theme.frame(grid, bg=fill)
+        title_row.grid(row=row_index, column=0, sticky="w", padx=(4, 0), pady=(2, 3))
+        theme.dot(title_row, row["billable"], bg=fill).pack(side="left", padx=(0, 4))
         theme.label(
-            cell, theme.ellipsize(row["heading"], limit),
-            fg=theme.MUTED, font=theme.FONT_TINY,
-        ).pack(anchor="w")
-        title_row = theme.frame(cell)
-        title_row.pack(anchor="w")
-        theme.dot(title_row, row["billable"]).pack(side="left", padx=(0, 4))
-        theme.label(
-            title_row, theme.ellipsize(row["task"], limit), font=theme.FONT_SMALL,
+            title_row, theme.ellipsize(row["task"], limit), bg=fill, font=theme.FONT_SMALL,
         ).pack(side="left")
 
-    def _day_cell(self, cell: tk.Misc, line: Line, rounding: int) -> None:
+    def _day_cell(self, cell: tk.Misc, line: Line, rounding: int, fill: str) -> None:
         """Hours on the left, a note chip to its right — the chip's own fill
         tells you whether there's anything on it before you even click:
         accented when there's a note to copy, muted when there isn't."""
         hours = line.hours(rounding)
         theme.button(
             cell, hours, lambda: self._copy(hours, f"{hours}h copied"),
-            bg=theme.BG_INPUT, fg=theme.TEXT, font=theme.FONT_TINY, padx=3, pady=1,
+            bg=fill, fg=theme.TEXT, hover=theme.BG_INPUT, font=theme.FONT_TINY, padx=3, pady=1,
         ).pack(side="left")
 
         note = line.note_text()
@@ -408,13 +517,13 @@ class ExportView:
                 n, f"Note copied ({c} entr{'y' if c == 1 else 'ies'})"
             )) if note else (lambda: None),
             fallback="\U0001f4ac",
-            fill=theme.ACCENT_DIM if note else theme.BG,
+            fill=theme.ACCENT_DIM if note else fill, bg=fill,
             size=16, radius=5, enabled=bool(note),
         ).pack(side="left", padx=(1, 0))
 
     def _row(self, parent: tk.Misc, line: Line, rounding: int) -> None:
-        card = theme.frame(parent, bg=theme.BG_RAISED, highlightthickness=1)
-        card.config(highlightbackground=theme.LINE)
+        card = theme.frame(parent, bg=theme.BG_RAISED, highlightthickness=0)
+        theme.round_corners(card, 8, border=theme.LINE)
         card.pack(fill="x", pady=2)
 
         top = theme.frame(card, bg=theme.BG_RAISED)
@@ -504,143 +613,6 @@ class ExportView:
                 widget.config(bg=was)
 
         self.frame.after(600, restore)
-
-    def _week_table(self) -> list[list[str]]:
-        """The week grid as plain rows and columns — what both the TSV and
-        CSV forms are built from, and what the on-screen grid itself draws.
-        Blank cells are blank here too, same as a day nothing was logged.
-        """
-        rounding = EXACT
-        header = (
-            WEEK_LABEL_COLUMNS + [self._day_heading(d) for d in self.dates] + ["Total"]
-        )
-        table = [header]
-
-        day_totals = [0] * len(self.dates)
-        grand_total = 0
-        for row in self._week_rows():
-            cells = [row["heading"], row["task"], "Billable" if row["billable"] else "Non-billable"]
-            row_total = 0
-            for index, date in enumerate(self.dates):
-                line = row["by_date"].get(date)
-                if line is None:
-                    cells.append("")
-                    continue
-                minutes = line.rounded(rounding)
-                row_total += minutes
-                day_totals[index] += minutes
-                cells.append(line.hours(rounding))
-            grand_total += row_total
-            cells.append(f"{to_decimal_hours(row_total):.2f}" if row_total else "")
-            table.append(cells)
-
-        table.append(
-            ["Total", "", ""]
-            + [f"{to_decimal_hours(t):.2f}" if t else "" for t in day_totals]
-            + [f"{to_decimal_hours(grand_total):.2f}" if grand_total else ""]
-        )
-        return table
-
-    def _as_tsv(self) -> str:
-        if self.mode == "week":
-            return "\n".join("\t".join(row) for row in self._week_table())
-        rounding = EXACT
-        rows = ["\t".join(DAY_COLUMNS)]
-        for line in self.lines:
-            rows.append(
-                "\t".join(
-                    [
-                        line.date,
-                        line.client_name,
-                        line.project_name,
-                        line.k_code,
-                        line.display_title,
-                        line.hours(rounding),
-                        line.note_text(),
-                    ]
-                )
-            )
-        return "\n".join(rows)
-
-    def _copy_table(self) -> None:
-        if not self.lines:
-            self._flash("Nothing to copy")
-            return
-        count = len(self._week_rows()) if self.mode == "week" else len(self.lines)
-        noun = "task" if self.mode == "week" else "row"
-        self._copy(
-            self._as_tsv(),
-            f"{count} {noun}{'' if count == 1 else 's'} copied \u2014 paste into a sheet",
-        )
-
-    def _save(self) -> None:
-        directory = paths.exports_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / self.filename
-        target.write_text(build_markdown(self.store.db, self.dates, self.title), "utf-8")
-        self._flash(f"Saved {self.filename}")
-
-    def _as_csv(self) -> str:
-        """Same rows as :meth:`_as_tsv`, but through the ``csv`` module.
-
-        A note with a comma or a line break in it would break a naive
-        join-on-comma; ``csv.writer`` quotes whatever needs it so the file
-        still opens as one column per field.
-        """
-        buffer = io.StringIO()
-        writer = csv.writer(buffer)
-        if self.mode == "week":
-            for row in self._week_table():
-                writer.writerow(row)
-            return buffer.getvalue()
-
-        rounding = EXACT
-        writer.writerow(DAY_COLUMNS)
-        for line in self.lines:
-            writer.writerow(
-                [
-                    line.date,
-                    line.client_name,
-                    line.project_name,
-                    line.k_code,
-                    line.display_title,
-                    line.hours(rounding),
-                    line.note_text(),
-                ]
-            )
-        return buffer.getvalue()
-
-    def _open_csv(self) -> None:
-        """Writes the table to ``exports/`` as a ``.csv`` and opens it.
-
-        Opening it rather than just the folder (``_open_exports``) is the
-        point: Explorer hands a ``.csv`` straight to Excel or whatever else
-        is registered for it, so the table is already on screen.
-
-        Stamped with the time, down to the second, rather than reusing
-        ``self.filename``'s plain day/week name: Excel refuses to open a
-        second file that shares a name with one it already has open, so a
-        repeat click — exporting again after logging more time — would
-        otherwise hit a wall instead of a fresh table. A second click inside
-        the same second is still possible, so a numeric suffix backs the
-        timestamp up rather than trusting it alone.
-        """
-        if not self.lines:
-            self._flash("Nothing to export")
-            return
-        directory = paths.exports_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        stem = f"{self.filename.removesuffix('.md')}-{stamp}"
-        target = directory / f"{stem}.csv"
-        suffix = 1
-        while target.exists():
-            suffix += 1
-            target = directory / f"{stem}-{suffix}.csv"
-        # newline="" so csv's own \r\n survives instead of becoming \r\r\n.
-        target.write_text(self._as_csv(), "utf-8", newline="")
-        os.startfile(target)  # noqa: S606 - opening it is the intent
-        self._flash(f"Opened {target.name}")
 
     def _open_exports(self) -> None:
         directory = paths.exports_dir()

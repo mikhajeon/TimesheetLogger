@@ -364,19 +364,27 @@ def main() -> int:
     )
     print("  Day tab: each entry's own Planned Hours is independent of its siblings")
 
-    # The detail panel (recurrence, archive, delete) belongs right under
-    # whichever row was actually clicked to open it — the first of the two
-    # here — not always the task's last row, and not after "+ log another
-    # entry" either, wherever that lands relative to the row picked.
-    today_view._toggle_expanded(rows_task.id, own_rows[0].id)
-    overlay.root.update()
+    # The detail panel (recurrence, archive, delete) opens as a dimmed
+    # modal over the whole tab now — see ``TodayView._open_modal`` — rather
+    # than inline under whichever row was clicked, so opening one for the
+    # first of these two rows shouldn't move either row at all.
     row_widgets = dict(today_view._row_widgets)
     first_y = row_widgets[own_rows[0].id].winfo_rooty()
     second_y = row_widgets[own_rows[1].id].winfo_rooty()
-    detail_y = today_view._repeat.frame.winfo_rooty()
-    assert first_y < detail_y < second_y, (
-        f"detail panel should sit between the clicked row and the next one: "
-        f"first={first_y} detail={detail_y} second={second_y}"
+    today_view._toggle_expanded(rows_task.id, own_rows[0].id)
+    overlay.root.update()
+    assert today_view._modal_row_id == own_rows[0].id, (
+        "toggling a row should open that row's own modal, not any other row's"
+    )
+    assert today_view._modal is not None and today_view._modal.winfo_ismapped(), (
+        "the detail panel should now open as a dimmed modal over the whole tab"
+    )
+    row_widgets = dict(today_view._row_widgets)
+    assert row_widgets[own_rows[0].id].winfo_rooty() == first_y, (
+        "a row's own position shouldn't shift just because its modal opened"
+    )
+    assert row_widgets[own_rows[1].id].winfo_rooty() == second_y, (
+        "the next row shouldn't move either — the modal floats over it, not between them"
     )
     # Planned Hours no longer follows expand/collapse the way the detail
     # panel does: every row owns its entry's own figure now, so it's an
@@ -611,7 +619,7 @@ def main() -> int:
 
     # The view-mode selector actually changes what's grouped, live.
     today_view = overlay._views["Today"]
-    today_view._on_grouping_change("By Project")
+    today_view._on_grouping_change("Project")
     overlay.root.update()
     assert store.db.settings.day_grouping == "project", "the selector didn't reach Settings"
     headings = [h for h, _rows in store.grouped_day_rows(today()) if h]
@@ -812,6 +820,44 @@ def main() -> int:
     overlay.root.update()
     print("  Day tab: the recurring indicator shows only next to a row tied to a recurring note")
 
+    # A recurring note's still-unlogged placeholder shows and edits its own
+    # "usual" Planned Hours (``RecurringNote.minutes``) the same way every
+    # other row does now, rather than a plain "usually Xm" label — picking
+    # a new figure here changes what every future occurrence plans, not a
+    # day-level ``Plan`` (which would otherwise suppress every recurring
+    # note due that day, including this one's own siblings).
+    pending_card = dict(today_view._row_widgets)[pending.id]
+    pending_stats = pending_card.winfo_children()[0]
+    pending_pickers = find_widgets(pending_stats, tk.Button)
+    assert len(pending_pickers) == 2, (
+        f"a recurring placeholder should have Actual + Planned Hours both editable, "
+        f"found {len(pending_pickers)}"
+    )
+    plan_picker = pending_pickers[1]
+    assert plan_picker.cget("text") == "15m", (
+        f"the placeholder's Planned Hours should start at the note's own usual minutes, "
+        f"got {plan_picker.cget('text')!r}"
+    )
+    plan_picker.invoke()
+    overlay.root.update()
+    popup = next(w for w in pending_stats.winfo_children() if isinstance(w, tk.Toplevel))
+    next(b for b in find_widgets(popup, tk.Button) if b.cget("text") == "45m").invoke()
+    overlay.root.update()
+    admin_note = next(n for n in store.db.recurring_notes if n.task_id == notes_task.id and n.note == "Daily admin")
+    assert admin_note.minutes == 45, (
+        f"editing a recurring placeholder's Planned Hours should update the note's own minutes, "
+        f"got {admin_note.minutes}"
+    )
+    assert not any(p.task_id == notes_task.id and p.date == today() for p in store.db.plans), (
+        "editing a recurring placeholder's Planned Hours shouldn't create a day-level Plan"
+    )
+    pending_card = dict(today_view._row_widgets)[pending.id]
+    pending_stats = pending_card.winfo_children()[0]
+    assert find_widgets(pending_stats, tk.Button)[1].cget("text") == "45m", (
+        "the row should reflect the note's new usual minutes after the edit"
+    )
+    print("  Day tab: a recurring placeholder's Planned Hours edits the note's own usual minutes")
+
     # Unlike an ordinary placeholder, a recurring note's still-unlogged one
     # has something real to dismiss (today's occurrence), so its delete chip
     # is live rather than inert, and arms "Skip" instead of "Delete".
@@ -1010,10 +1056,9 @@ def main() -> int:
     # so the proof it took is that the task shows up on a future day it
     # matches and stays away from one it doesn't.
     overlay.show_tab("Today")
-    overlay._views["Today"]._expanded = {task.id}
-    overlay._views["Today"].refresh()
-    overlay.root.update()
     anchor_row = [r for r in store.day_rows(today()) if r.context.task.id == task.id][-1]
+    overlay._views["Today"]._toggle_expanded(task.id, anchor_row.id)
+    overlay.root.update()
     assert anchor_row.recurring_note_id == "", "the row started out not tied to any note"
     assert overlay._views["Today"]._repeat.rule is None, "the row started out not repeating"
     # "Does not repeat" next to an unticked checkbox only says the checkbox's
@@ -1084,7 +1129,7 @@ def main() -> int:
         "turning repeat off didn't save, or created a second note instead of editing this one"
     )
     assert len(store.recurring_notes_for_task(task.id)) == 1, "turning repeat off duplicated the note"
-    overlay._views["Today"]._expanded = set()
+    overlay._views["Today"]._close_modal()
 
     # The Week grid sizes its columns to the window, so it has to fit in the
     # narrowest case — seven day columns in a window as narrow as "small"

@@ -1,0 +1,37 @@
+---
+description: How to build any window animation (expand, collapse, resize, ...) in this app
+alwaysApply: true
+---
+
+# Animation pattern: ghost window, never live widgets
+
+Animating the real Tk window (SetWindowPos or `geometry` per frame, with
+widgets re-laid-out) is jittery. Every window animation here uses the same
+recipe — see `_ghost_morph`, `_collapse_live`, `_resize_glide` in
+`timesheet/ui/overlay.py`, `winfx.Ghost`, and `timesheet/anim.py`.
+
+1. **Snapshot** the current window (`winfx.capture`) and show it in a
+   `winfx.Ghost(max_w, max_h, click_through=False)` exactly over the window.
+   Wait one `DwmFlush` so it is on screen, then set the real window to
+   `-alpha 0`.
+2. **Animate only the ghost**: `anim.run(ms, frame, easing=...)` paced by
+   `DwmFlush`; each frame is one `ghost.draw(rect, a, b, mix, opacity,
+   border=...)`. The first ~20% dissolves the snapshot into a plain
+   panel-coloured rectangle in place (`hold`), then the rectangle eases to the
+   target rect. Never show a stretched snapshot of text. No Tk work, no
+   `update()` per frame (except where input must stay live).
+3. **Shield**: `_raise_shield(rect)` over the whole area touched (union of
+   start and end rects) for the full animation. A fully transparent real
+   window lets clicks fall through to the app behind and bring it forward.
+   `Ghost(click_through=False)` windows refuse activation (WM_MOUSEACTIVATE
+   -> MA_NOACTIVATE) so the foreground never moves.
+4. **Do the real change once, hidden, after the animation**: freeze
+   (`dwm.freeze`), set geometry / pack contents / rebuild the view, thaw,
+   `update()`, `DwmFlush`, then restore `-alpha`.
+5. **Reveal**: drop the shield, `ghost.set_click_through(True)`, fade the
+   ghost out (~120 ms) over the live window, then close it.
+6. Set `_morphing = True` for the duration (disables click-out collapse and
+   re-entrancy), clean up ghosts/shield in `finally`, and keep a plain
+   non-animated fallback if the ghost cannot be created.
+7. Verify with real injected clicks over a second window behind the app
+   (foreground must stay on the app) and by checking frame gaps are ~16.7 ms.

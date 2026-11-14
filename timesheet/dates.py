@@ -96,14 +96,37 @@ def day_name(value: ISODate, long: bool = False) -> str:
     return from_iso(value).strftime("%A" if long else "%a")
 
 
+#: How dates are written on screen (``Settings.date_format``): key ->
+#: (full form, short form without the year). Set once by the store whenever
+#: the setting loads or changes, so every label formats the same way.
+DATE_FORMATS = {
+    "iso": ("%Y-%m-%d", "%m-%d"),
+    "dmy": ("%d/%m/%Y", "%d/%m"),
+    "mdy": ("%m/%d/%Y", "%m/%d"),
+    "text": ("%d %b %Y", "%d %b"),
+}
+DEFAULT_DATE_FORMAT = "iso"
+_date_format = DEFAULT_DATE_FORMAT
+
+
+def set_date_format(key: str) -> None:
+    global _date_format
+    _date_format = key if key in DATE_FORMATS else DEFAULT_DATE_FORMAT
+
+
+def format_date(value: ISODate) -> str:
+    """``2026-11-13`` / ``13/11/2026`` / ``11/13/2026`` / ``13 Nov 2026``."""
+    return from_iso(value).strftime(DATE_FORMATS[_date_format][0])
+
+
 def pretty_date(value: ISODate) -> str:
-    date = from_iso(value)
-    return f"{date.strftime('%A')} {date.day} {date.strftime('%b %Y')}"
+    """The weekday and the full date, in the chosen format."""
+    return f"{day_name(value, long=True)} {format_date(value)}"
 
 
 def short_date(value: ISODate) -> str:
-    date = from_iso(value)
-    return f"{date.day} {date.strftime('%b')}"
+    """The date without its year: ``11-13`` / ``13/11`` / ``11/13`` / ``13 Nov``."""
+    return from_iso(value).strftime(DATE_FORMATS[_date_format][1])
 
 
 def format_minutes(minutes: float) -> str:
@@ -121,6 +144,40 @@ def format_minutes(minutes: float) -> str:
 def to_decimal_hours(minutes: float) -> float:
     """Hours as most timesheet systems want them, e.g. 2.25."""
     return round(minutes / 60, 2)
+
+
+def format_decimal_hours(minutes: float, places: int = 1) -> str:
+    """Fixed-decimal hours — ``"1.5"``, ``"0.3"``, ``"2.0"`` at the default
+    one place — for the few spots tight enough that even
+    ``format_duration``'s own "7h 30m" or a two-decimal ``to_decimal_hours``
+    costs more width than they can spare: the collapsed badge's own timer,
+    and the Stop preview above the timer bar's clock. Deliberately not
+    tied to ``Settings.hour_format`` the way ``format_duration`` is — a
+    glance at a badge the size of a desktop icon calls for the same
+    compact shape either way, not a choice between two.
+
+    ``places`` goes past that default of one for a timer that's actually
+    ticking (see ``Overlay._tick``/``_refresh_badge_timer``): one decimal
+    place only moves roughly every six minutes, which over the short
+    stretch anyone's actually watching it reads as frozen even though it's
+    being recomputed every second same as the clock right beside it.
+    """
+    return f"{minutes / 60:.{places}f}"
+
+
+def format_duration(minutes: float, decimal: bool = False) -> str:
+    """An hour figure the way the app is set to show it (``Settings.hour_format``,
+    Preferences \u2192 under Theme): ``format_minutes`` (``7h 30m``) normally, or
+    plain decimal hours (``7.5``) when ``decimal`` is set.
+
+    Only for what the app displays live — what gets exported or copied out
+    (see ``bookings.py``, ``timesheet/ui/export.py``) always stays
+    ``to_decimal_hours`` regardless of this, since that figure has to read
+    the same way no matter how the user likes their own screen formatted.
+    """
+    if decimal:
+        return f"{to_decimal_hours(minutes):g}"
+    return format_minutes(minutes)
 
 
 def format_clock(seconds: float) -> str:

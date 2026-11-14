@@ -16,6 +16,9 @@ from __future__ import annotations
 import tkinter as tk
 from typing import Callable
 
+from .. import winfx
+from . import yielding
+
 DEFAULT = "dark"
 
 #: Token -> colour, per palette. Tokens are named for their role rather than
@@ -41,6 +44,8 @@ PALETTES: dict[str, dict[str, str]] = {
         "ON_DANGER": "#2a0d0d",
         "IDLE": "#3a4156",
         "PILL_TEXT": "#a9b3cc",
+        "PLANNED": "#e3b341",
+        "PLANNED_BG": "#2e2710",
     },
     "light": {
         "BG": "#eef1f6",
@@ -62,6 +67,8 @@ PALETTES: dict[str, dict[str, str]] = {
         "ON_DANGER": "#ffffff",
         "IDLE": "#aeb7c6",
         "PILL_TEXT": "#3f4a60",
+        "PLANNED": "#b98900",
+        "PLANNED_BG": "#fbf2d9",
     },
 }
 
@@ -85,6 +92,14 @@ DANGER: str
 ON_DANGER: str
 IDLE: str
 PILL_TEXT: str
+#: The day progress bar's own "planned but not yet worked" colour (see
+#: ``today.py``'s ``_draw_progress``) — amber, the one role here with no
+#: other token already carrying that meaning.
+PLANNED: str
+#: A tinted backdrop behind ``PLANNED`` text — the Week tab's own "Planned"
+#: totals row (see ``week.py``'s ``_footer_rows``) — the same idea
+#: ``BILLABLE_BG`` already is for its own colour.
+PLANNED_BG: str
 
 #: Name of the palette currently bound — always a real key in ``PALETTES``,
 #: never ``"system"`` (see ``MODE`` for that).
@@ -126,6 +141,7 @@ FONT = ("Segoe UI", 11)
 FONT_BOLD = ("Segoe UI", 11, "bold")
 FONT_SMALL = ("Segoe UI", 10)
 FONT_TINY = ("Segoe UI", 9)
+FONT_TINY_BOLD = ("Segoe UI", 9, "bold")
 FONT_HEAD = ("Segoe UI", 10, "bold")
 FONT_CLOCK = ("Consolas", 14, "bold")
 FONT_MONO = ("Consolas", 10)
@@ -172,7 +188,102 @@ use(DEFAULT)
 
 
 def frame(parent: tk.Misc, bg: str | None = None, **kw) -> tk.Frame:
+    yielding.checkpoint()  # a long build lets clicks through here
     return tk.Frame(parent, bg=bg or BG, **kw)
+
+
+def heading_label(
+    parent: tk.Misc,
+    text: str,
+    *,
+    fg: str | None = None,
+    font: tuple = FONT_HEAD,
+) -> tk.Frame:
+    """A heading whose ``[K-code]`` part is clickable and copies the code.
+
+    Everything else in ``text`` is drawn as plain labels; only the bracketed
+    chunk gets the hand cursor and the click-to-copy binding.
+    """
+    import re
+
+    box = frame(parent)
+    for part in filter(None, re.split(r"(\[[^\]]+\])", text)):
+        if part.startswith("[") and part.endswith("]"):
+            code = part[1:-1]
+            chip = label(box, part, fg=fg, font=font, cursor="hand2")
+            chip.pack(side="left")
+
+            def copy(_e, c=code, w=chip) -> None:
+                w.clipboard_clear()
+                w.clipboard_append(c)
+                w.config(fg=ACCENT)
+                w.after(700, lambda: w.winfo_exists() and w.config(fg=fg or TEXT))
+
+            chip.bind("<Button-1>", copy)
+        else:
+            label(box, part, fg=fg, font=font).pack(side="left")
+    return box
+
+
+def round_corners(
+    widget: tk.Misc, radius: int = 8, border: str | None = None, thickness: int = 1
+) -> None:
+    """Gives a Frame/Toplevel rounded corners (see ``winfx.round_hwnd``),
+    re-applied whenever it's resized. The corners show whatever is behind
+    the widget, so use it on cards sitting on the plain background.
+
+    With ``border`` the outline is drawn as a rounded stroke of its own
+    (a plain widget over the card, clipped to a concentric rounded
+    outline) instead of Tk's highlight ring, which is always a plain
+    rectangle and just gets its corners sliced off. Recolour it with
+    ``set_border``."""
+    toplevel = isinstance(widget, tk.Toplevel)
+    ring: tk.Frame | None = None
+    if border is not None:
+        ring = tk.Frame(widget, bg=border, bd=0, highlightthickness=0, cursor="arrow")
+        ring.place(x=0, y=0, relwidth=1, relheight=1)
+        widget._ring = ring  # type: ignore[attr-defined]
+        widget._ring_width = thickness  # type: ignore[attr-defined]
+        widget.config(highlightthickness=0)
+        # Clicks on the stroke belong to the card underneath.
+        for sequence in ("<Button-1>", "<ButtonRelease-1>", "<B1-Motion>", "<Double-Button-1>"):
+            ring.bind(sequence, lambda e, s=sequence: widget.event_generate(
+                s, x=e.x, y=e.y, rootx=e.x_root, rooty=e.y_root))
+
+    def apply(_event=None) -> None:
+        w, h = widget.winfo_width(), widget.winfo_height()
+        if ring is not None:
+            tk.Misc.lift(ring)  # over whatever has been added since
+        key = (w, h, getattr(widget, "_ring_width", 1))
+        if w < 2 or h < 2 or getattr(widget, "_round_size", None) == key:
+            return
+        widget._round_size = key  # type: ignore[attr-defined]
+        handle = widget.winfo_id()
+        try:
+            winfx.round_hwnd(winfx.root_hwnd(handle) if toplevel else handle, w, h, radius)
+            if ring is not None:
+                winfx.ring_hwnd(ring.winfo_id(), w, h, radius, key[2])
+        except OSError:
+            pass  # square corners are a fine fallback
+
+    widget.bind("<Configure>", apply, add="+")
+    widget.after_idle(apply)
+
+
+def set_border(widget: tk.Misc, colour: str, thickness: int = 1) -> None:
+    """Recolours (and re-thickens) a ``round_corners(border=...)`` stroke."""
+    if hasattr(widget, "set_border"):  # an anti-aliased ``modern.Surface``
+        widget.set_border(colour, thickness)
+        return
+    ring = getattr(widget, "_ring", None)
+    if ring is None:
+        widget.config(highlightbackground=colour, highlightthickness=thickness)
+        return
+    ring.config(bg=colour)
+    if getattr(widget, "_ring_width", 1) != thickness:
+        widget._ring_width = thickness  # type: ignore[attr-defined]
+        widget._round_size = None  # type: ignore[attr-defined]
+        widget.after_idle(lambda: widget.winfo_exists() and widget.event_generate("<Configure>"))
 
 
 def commit_focused_entry(widget: tk.Misc) -> None:
@@ -202,6 +313,7 @@ def label(
     anchor: str = "w",
     **kw,
 ) -> tk.Label:
+    yielding.checkpoint()
     return tk.Label(
         parent, text=text, bg=bg or BG, fg=fg or TEXT, font=font, anchor=anchor, **kw
     )
@@ -359,9 +471,19 @@ def duration_picker(
     label: Callable[[int], str] | None = None,
     padx: int = 8,
     pady: int = 3,
+    open_upward: bool = False,
 ) -> tk.Button:
     """A button opening a scrollable popup of durations in fixed, 15-minute
     steps, in place of a free-typed box.
+
+    ``open_upward=True`` (the Day tab's own Actual/Planned Hours pickers,
+    one card after another stacked down the page) opens the popup above
+    the button instead of below, and reverses the list so it still reads
+    the same way relative to the button either way: whichever end sits
+    right against the button is the smallest figures, and scrolling away
+    from the button — down normally, up here — is what climbs toward the
+    largest one. Flipping the popup without also flipping the list would
+    have put the biggest numbers right next to the button instead.
 
     Drawn the same way ``date_picker`` is — a plain button toggling a
     borderless ``Toplevel`` underneath it — rather than a native
@@ -392,6 +514,8 @@ def duration_picker(
     options = list(range(0, max_minutes + 1, step))
     if minutes not in options:
         options = sorted(set(options) | {minutes})
+    if open_upward:
+        options = list(reversed(options))
 
     state = {"value": minutes, "popup": None}
 
@@ -404,9 +528,11 @@ def duration_picker(
         else:
             _open()
 
-    display = button(parent, _label_text(), _toggle, font=font, padx=padx, pady=pady)
-    if width:
-        display.config(width=width)
+    from .modern import ValueButton
+
+    display = ValueButton(
+        parent, _label_text(), _toggle, font=font, width=width, pady=max(1, pady),
+    )
 
     def _close() -> None:
         popup = state["popup"]
@@ -425,6 +551,7 @@ def duration_picker(
         popup.overrideredirect(True)
         popup.attributes("-topmost", True)
         popup.configure(bg=BG_RAISED, highlightthickness=1, highlightbackground=LINE)
+        round_corners(popup, 6)
         state["popup"] = popup
 
         scroller = ScrollFrame(popup, bg=BG_RAISED)
@@ -446,7 +573,10 @@ def duration_picker(
         popup.update_idletasks()
         height = min(_DURATION_POPUP_MAX_HEIGHT, scroller.body.winfo_reqheight())
         x = display.winfo_rootx()
-        y = display.winfo_rooty() + display.winfo_height() + 2
+        if open_upward:
+            y = display.winfo_rooty() - height - 2
+        else:
+            y = display.winfo_rooty() + display.winfo_height() + 2
         popup.geometry(f"{_DURATION_POPUP_WIDTH}x{height}+{x}+{y}")
         # Settles the canvas at its new, possibly-constrained size — without
         # this, the scrollbar's own visibility (decided off the canvas's
@@ -498,7 +628,12 @@ def date_picker(
     def label_text() -> str:
         return state["value"] or placeholder
 
-    display = button(parent, label_text(), lambda: _toggle(), font=font, width=width)
+    from .modern import ValueButton
+
+    display = ValueButton(
+        parent, label_text(), lambda: _toggle(), font=font, width=width, pady=2,
+        chevron=False,
+    )
     display.config(fg=TEXT if state["value"] else MUTED)
 
     def _close() -> None:
@@ -576,6 +711,7 @@ def date_picker(
         popup.overrideredirect(True)
         popup.attributes("-topmost", True)
         popup.configure(bg=BG_RAISED, highlightthickness=1, highlightbackground=LINE)
+        round_corners(popup, 6)
         x, y = display.winfo_rootx(), display.winfo_rooty() + display.winfo_height() + 2
         popup.geometry(f"+{x}+{y}")
         state["popup"] = popup
@@ -675,6 +811,86 @@ def pill(parent: tk.Misc, text: str, *, fg: str | None = None, bg: str | None = 
     )
 
 
+def header_fill() -> str:
+    """The backdrop of a table's column-header band (the Week and Export
+    day headings): a step further from the page than the alternating row
+    bands are, so the headings read as their own strip, not as row one."""
+    return blend(BG, TEXT, 0.13)
+
+
+_GRIP_IMAGES: dict[tuple, tk.PhotoImage] = {}
+
+
+def _grip_png(colour: str, bg: str, scale: int) -> bytes:
+    """A grip of six round dots (two columns of three) as PNG bytes, drawn
+    with anti-aliased edges — each pixel's coverage is sampled 4x4 and the
+    dot colour blended over ``bg`` — so it stays crisp where the "☰" glyph
+    it replaces was a jagged, font-dependent blur. Standard library only."""
+    import struct
+    import zlib
+
+    width, height = 11 * scale, 15 * scale
+    radius = 1.45 * scale
+    centres = [(x * scale, y * scale) for x in (3, 8) for y in (3, 7.5, 12)]
+
+    def channels(value: str) -> tuple[int, int, int]:
+        value = value.lstrip("#")
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+    dot_rgb, bg_rgb = channels(colour), channels(bg)
+    samples = 4
+    rows = bytearray()
+    for py in range(height):
+        rows.append(0)  # PNG filter: none
+        for px in range(width):
+            hits = 0
+            for sy in range(samples):
+                for sx in range(samples):
+                    x = px + (sx + 0.5) / samples
+                    y = py + (sy + 0.5) / samples
+                    if any((x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2 for cx, cy in centres):
+                        hits += 1
+            t = hits / (samples * samples)
+            rows.extend(round(b + (d - b) * t) for d, b in zip(dot_rgb, bg_rgb))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def grip(parent: tk.Misc, bg: str | None = None) -> tk.Label:
+    """A drag handle: a six-dot grip, muted until hovered. Bind the drag
+    events on the returned widget. Sized for the display's scaling."""
+    import base64
+
+    bg = bg or BG
+    try:
+        scale = max(1, round(parent.winfo_fpixels("1i") / 96))
+    except tk.TclError:
+        scale = 1
+
+    def image(colour: str) -> tk.PhotoImage:
+        key = (colour, bg, scale, id(parent.winfo_toplevel().tk))
+        if key not in _GRIP_IMAGES:
+            _GRIP_IMAGES[key] = tk.PhotoImage(
+                master=parent, data=base64.b64encode(_grip_png(colour, bg, scale))
+            )
+        return _GRIP_IMAGES[key]
+
+    resting, active = image(MUTED), image(TEXT)
+    handle = tk.Label(parent, image=resting, bg=bg, bd=0, padx=2, cursor="fleur")
+    handle.bind("<Enter>", lambda _e: handle.config(image=active), add="+")
+    handle.bind("<Leave>", lambda _e: handle.config(image=resting), add="+")
+    return handle
+
+
 def dot(parent: tk.Misc, billable: bool, bg: str | None = None) -> tk.Canvas:
     canvas = tk.Canvas(parent, width=11, height=11, bg=bg or BG, highlightthickness=0, bd=0)
     canvas.create_oval(1, 1, 10, 10, fill=BILLABLE if billable else IDLE, outline="")
@@ -700,23 +916,21 @@ def radio(
     static once drawn, the same as every other row control here, since the
     whole row is rebuilt on the next refresh rather than repainted in place.
     """
-    fill = fill or ACCENT
-    canvas = tk.Canvas(
-        parent, width=size, height=size, bg=bg or BG, highlightthickness=0, bd=0,
-        cursor="hand2" if enabled else "arrow",
+    from .modern import radio as modern_radio
+
+    # Anti-aliased ring + dot, with a hover state — see ``modern.radio``.
+    return modern_radio(
+        parent, selected, command, fill=fill or ACCENT, bg=bg or BG, size=size, enabled=enabled
     )
-    pad = 2
-    if selected:
-        canvas.create_oval(pad, pad, size - pad, size - pad, fill=fill, outline="")
-    else:
-        canvas.create_oval(pad, pad, size - pad, size - pad, fill="", outline=MUTED, width=1.5)
-    if enabled:
-        canvas.bind("<Button-1>", lambda _e: command())
-    return canvas
 
 
-def _darken(colour: str, amount: float) -> str:
-    """Blends a hex colour toward black, for a chip's pressed/hover state.
+def darken(colour: str, amount: float) -> str:
+    """Blends a hex colour toward black by a fixed fraction — a chip's own
+    pressed/hover state (see ``chip``, ``confirm``), or a solid stand-in for
+    a translucent scrim (see ``timesheet/ui/today.py``'s ``_open_modal``):
+    Tk has no per-widget alpha on Windows, so "50% transparent black over
+    the page" is approximated here as a flat colour, computed once rather
+    than redrawn translucently every frame.
 
     A fixed darken reads fine in either palette, unlike a fixed lighten —
     which would wash out a colour that's already light in the light palette.
@@ -727,23 +941,57 @@ def _darken(colour: str, amount: float) -> str:
     return f"#{mix(r):02x}{mix(g):02x}{mix(b):02x}"
 
 
-def _round_rect(canvas: tk.Canvas, x0: float, y0: float, x1: float, y1: float, radius: float, fill: str) -> None:
-    """Fills a rounded rectangle: a plain cross of two rects, plus a filled
-    circle inset into each corner to round it off.
+def _round_rect_points(x0: float, y0: float, x1: float, y1: float, radius: float) -> list[float]:
+    """The 12 control points of a rounded rectangle, for ``create_polygon``
+    with ``smooth=True`` — a corner marked by two points straddling it
+    (one on each adjoining side) rather than a true arc, which Tk's canvas
+    then rounds off on its own via its built-in spline smoothing.
 
-    Simpler than a smoothed polygon, and the radii this app uses are small
-    enough (a handful of pixels) that the facets aren't visible.
+    One shape, however it's drawn (filled by ``_round_rect``, stroked by
+    ``_round_rect_outline``) — not the separate rectangle-plus-corner-circle
+    primitives both used before: those are independently rasterised by Tk,
+    and a filled rectangle and a filled oval don't always come out aligned
+    to the same pixel even when their edges meet exactly on paper, which is
+    what made every rounded corner in the app (not just the one this was
+    first noticed on) look faceted/irregular rather than cleanly round.
     """
+    return [
+        x0 + radius, y0,
+        x1 - radius, y0,
+        x1, y0,
+        x1, y0 + radius,
+        x1, y1 - radius,
+        x1, y1,
+        x1 - radius, y1,
+        x0 + radius, y1,
+        x0, y1,
+        x0, y1 - radius,
+        x0, y0 + radius,
+        x0, y0,
+    ]
+
+
+def _round_rect(canvas: tk.Canvas, x0: float, y0: float, x1: float, y1: float, radius: float, fill: str) -> None:
+    """Fills a rounded rectangle as a single smoothed polygon — see
+    ``_round_rect_points``."""
     radius = min(radius, (x1 - x0) / 2, (y1 - y0) / 2)
-    canvas.create_rectangle(x0 + radius, y0, x1 - radius, y1, fill=fill, outline="")
-    canvas.create_rectangle(x0, y0 + radius, x1, y1 - radius, fill=fill, outline="")
-    for cx, cy in (
-        (x0 + radius, y0 + radius),
-        (x1 - radius, y0 + radius),
-        (x0 + radius, y1 - radius),
-        (x1 - radius, y1 - radius),
-    ):
-        canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, fill=fill, outline="")
+    canvas.create_polygon(
+        _round_rect_points(x0, y0, x1, y1, radius), smooth=True, fill=fill, outline="",
+    )
+
+
+def _round_rect_outline(
+    canvas: tk.Canvas, x0: float, y0: float, x1: float, y1: float,
+    radius: float, outline: str, width: int = 1,
+) -> None:
+    """Strokes a rounded rectangle's own edge — the same smoothed polygon
+    ``_round_rect`` fills (see ``_round_rect_points``), just unfilled and
+    stroked instead."""
+    radius = min(radius, (x1 - x0) / 2, (y1 - y0) / 2)
+    canvas.create_polygon(
+        _round_rect_points(x0, y0, x1, y1, radius), smooth=True, fill="",
+        outline=outline, width=width,
+    )
 
 
 def chip(
@@ -762,6 +1010,7 @@ def chip(
     enabled: bool = True,
     font: tuple = FONT_ICON_SMALL,
     circle: bool = False,
+    highlight: bool = False,
 ) -> tk.Canvas:
     """A small, slightly-rounded button, drawn rather than native.
 
@@ -790,16 +1039,31 @@ def chip(
     has nothing to act on yet, so the control sits in its usual spot (nothing
     jumps into existence the moment there's something to delete) without
     inviting a click that would have nowhere to go.
+
+    ``highlight=True`` rings the chip in ``ACCENT`` just inside its own edge
+    (the Day tab's date chip, when it's showing today — see ``today.py``'s
+    ``_build_header``/``refresh``) — a real stroked outline (see
+    ``_round_rect_outline``), inset slightly so it reads as a border sitting
+    inside the chip rather than traced exactly along its outer edge.
+    Toggled after creation with ``canvas.set_highlight``, same as
+    ``set_text``.
     """
     canvas = tk.Canvas(
         parent, width=width or size, height=height or size, bg=bg or BG,
         highlightthickness=0, bd=0, cursor="hand2" if enabled else "arrow",
     )
-    hover = _darken(fill, 0.16)
-    #: The last colour asked for and the text currently showing, so a
-    #: resize-triggered repaint (which knows neither) still comes out right
-    #: rather than resetting to ``fill`` or the text first passed in.
-    state = {"colour": fill, "text": text}
+    hover = darken(fill, 0.16)
+    #: How far in from the outer edge the highlight ring is stroked, and how
+    #: thick that stroke is — a border sitting just inside the chip's own
+    #: edge, not traced exactly along it.
+    HIGHLIGHT_INSET = 3
+    HIGHLIGHT_WIDTH = 2
+    #: The last colour asked for, the text currently showing, whether the
+    #: highlight ring is on, and the text's own tint — so a resize-triggered
+    #: repaint (which knows none of them) still comes out right rather than
+    #: resetting to whatever was first passed in, and ``set_enabled`` below
+    #: can dim the glyph along with disabling the click.
+    state = {"colour": fill, "text": text, "highlight": highlight, "text_fill": text_fill}
 
     def paint(colour: str | None = None) -> None:
         state["colour"] = colour or state["colour"]
@@ -811,17 +1075,46 @@ def chip(
             canvas.create_oval(1, 1, w - 1, h - 1, outline=state["colour"], width=2)
         else:
             _round_rect(canvas, 1, 1, w - 1, h - 1, radius, state["colour"])
+            if state["highlight"]:
+                i = HIGHLIGHT_INSET
+                _round_rect_outline(
+                    canvas, i, i, w - i, h - i,
+                    max(0, radius - i), ACCENT, HIGHLIGHT_WIDTH,
+                )
         if image is not None:
             canvas.create_image(w / 2, h / 2, image=image)
         elif state["text"]:
-            canvas.create_text(w / 2, h / 2, text=state["text"], fill=text_fill or TEXT, font=font)
+            item = canvas.create_text(
+                w / 2, h / 2, text=state["text"], fill=state["text_fill"] or TEXT, font=font
+            )
+            # ``anchor="center"`` (the default) centers on the *font's*
+            # declared ascent/descent for whatever's being drawn, not the
+            # glyph's own actual ink — the play/pause/stop symbols
+            # (\u25b6/\u23f8/\u23f9) come from a different, Windows-linked
+            # fallback font behind "Segoe UI" for characters it doesn't
+            # carry itself, with its own metrics that don't quite agree
+            # with the ones Tk centered against, so the glyph reads as
+            # sitting off to one side of its own button. Re-centering on
+            # the item's *actual* rendered bounding box instead fixes
+            # that regardless of which font actually drew it.
+            bbox = canvas.bbox(item)
+            if bbox:
+                x0, y0, x1, y1 = bbox
+                canvas.move(item, w / 2 - (x0 + x1) / 2, h / 2 - (y0 + y1) / 2)
+
+    def apply_enabled(value: bool, command_now: Callable[[], None]) -> None:
+        canvas.config(cursor="hand2" if value else "arrow")
+        canvas.unbind("<Enter>")
+        canvas.unbind("<Leave>")
+        canvas.unbind("<Button-1>")
+        if value:
+            canvas.bind("<Enter>", lambda _e: paint(hover))
+            canvas.bind("<Leave>", lambda _e: paint(fill))
+            canvas.bind("<Button-1>", lambda _e: command_now())
 
     paint(fill)
     canvas.bind("<Configure>", lambda _e: paint())
-    if enabled:
-        canvas.bind("<Enter>", lambda _e: paint(hover))
-        canvas.bind("<Leave>", lambda _e: paint(fill))
-        canvas.bind("<Button-1>", lambda _e: command())
+    apply_enabled(enabled, command)
     # Keeps the PhotoImage referenced for the canvas's life — Tk drops an
     # image the moment nothing holds it, taking the picture off screen.
     canvas.image = image
@@ -830,9 +1123,34 @@ def chip(
         state["text"] = new_text
         paint()
 
+    def set_highlight(value: bool) -> None:
+        state["highlight"] = value
+        paint()
+
+    def set_enabled(value: bool, text_fill: str | None = None) -> None:
+        """Flips a chip between clickable and inert after creation.
+
+        For a row whose entry crosses zero minutes through something other
+        than this chip's own click — the Actual Hours picker, say — which
+        used to leave the minus chip showing whatever state it was built
+        with (see ``today.py``'s ``_commit_row_minutes``) regardless of what
+        the figure actually did. Always rebinds to the same ``command`` this
+        chip was created with — there's no later way to ask for a different
+        one, nor any caller here that wants to.
+        """
+        state["text_fill"] = text_fill if text_fill is not None else state["text_fill"]
+        apply_enabled(value, command)
+        paint()
+
     #: For a chip whose label changes after creation — a date, say — rather
     #: than only ever being built once and torn down with its row.
     canvas.set_text = set_text
+    #: Same idea for ``highlight`` — the date chip's own ring switches on
+    #: and off as the day shown changes, without rebuilding the chip.
+    canvas.set_highlight = set_highlight
+    #: Same idea again, for a chip whose clickability depends on a figure
+    #: that can change out from under it without this row rebuilding.
+    canvas.set_enabled = set_enabled
     return canvas
 
 
@@ -876,7 +1194,7 @@ def confirm(
     row.pack(padx=16, pady=(0, 16), fill="x")
 
     confirm_btn = button(row, confirm_label, confirm_and_close, bg=DANGER, fg=ON_DANGER,
-                          hover=_darken(DANGER, 0.16))
+                          hover=darken(DANGER, 0.16))
     confirm_btn.pack(side="left")
     button(row, "Cancel", close).pack(side="left", padx=(8, 0))
 

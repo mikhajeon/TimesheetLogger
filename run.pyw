@@ -9,12 +9,16 @@ from timesheet.ui.overlay import Overlay
 
 
 def main() -> None:
-    # A second launch doesn't get a second overlay on the same data — it
-    # hands off to the one already running instead, same as most tray apps.
-    if singleton.already_running():
+    # A new launch replaces the running one: the old instance is closed
+    # (cleanly where it can be) and this one takes over its data folder.
+    # Only if no running window can be found to close does it fall back to
+    # bringing that instance forward instead.
+    if singleton.already_running() and not singleton.replace_existing():
         singleton.focus_existing()
         return
-    Overlay().run()
+    overlay = Overlay()
+    singleton.watch_for_quit(overlay.root, overlay.quit)
+    overlay.run()
 
 
 if __name__ == "__main__":

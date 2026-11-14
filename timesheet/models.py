@@ -6,6 +6,7 @@ rounding is applied only when exporting, so the underlying record stays honest.
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any
@@ -175,22 +176,86 @@ class SkippedNote:
 @dataclass
 class ActiveTimer:
     task_id: str
-    #: Unix seconds, so it survives a restart mid-task.
+    #: Unix seconds the *current* running segment began — moves forward
+    #: every time the timer resumes from a pause, so it's stale while
+    #: paused (see ``paused``). What "how much has this accrued" is
+    #: computed from directly — see ``elapsed_seconds`` — never which
+    #: calendar day the timer's own entry belongs to; that's
+    #: ``day_anchor``, below, which never moves.
     started_at: float
     note: str = ""
     #: Set when the timer was started from a ``RecurringNote``'s row, so the
     #: entry it produces on stopping is tagged the same way a typed-in or
     #: nudged one would be.
     recurring_note_id: str = ""
+    #: Set when the timer was started on a row that already had its own
+    #: logged ``Entry`` — an existing manual or timer entry picked up again
+    #: rather than a fresh placeholder. Stopping then tops that same entry's
+    #: minutes up instead of appending a brand new one (see
+    #: ``Store.stop_timer``), the same way the +/- chips top up rather than
+    #: littering the day with a separate entry per click.
+    entry_id: str = ""
+    #: Seconds already banked from every earlier running segment, before
+    #: whichever one is current (or, while paused, before the pause now in
+    #: effect) — so pausing and resuming never loses time already run up.
+    elapsed_before: float = 0.0
+    #: Whether the timer is currently paused — while ``True``,
+    #: ``started_at`` is stale and ``elapsed_before`` alone already holds
+    #: everything banked up to the pause.
+    paused: bool = False
+    #: True once idle detection (see ``timesheet.idle``) paused this timer
+    #: on its own, rather than the user pressing Pause — only this kind of
+    #: pause lifts itself the moment activity is seen again; a pause the
+    #: user chose stays a pause until they choose to resume it.
+    auto_paused: bool = False
+    #: Unix seconds the timer was first started, before any pause — fixed
+    #: for the timer's whole life, purely to anchor which calendar day this
+    #: timer (and the entry it produces on stopping) belongs to,
+    #: independent of whichever segment happens to be current when it's
+    #: actually stopped.
+    day_anchor: float = 0.0
+
+    @property
+    def is_paused(self) -> bool:
+        return self.paused
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Total time this timer has banked so far, across every
+        run/pause/resume segment — what every caller wanting "how long has
+        this really been running" should read instead of ``started_at``
+        directly, which on its own ignores any pause."""
+        if self.paused:
+            return self.elapsed_before
+        return self.elapsed_before + max(0.0, time.time() - self.started_at)
 
 
 @dataclass
 class Settings:
     always_on_top: bool = True
+    #: Whether collapsing to the small badge (see ``Overlay.collapse``) pins
+    #: it on top too, even while "Always on top" above is off — on by
+    #: default, since a badge that's about to get buried behind whatever
+    #: else is open defeats the point of shrinking down to one rather than
+    #: just minimising normally. Doesn't touch "Always on top" itself, or
+    #: persist a pin past the badge — expanding back to the full view
+    #: always drops back to whatever that setting actually says.
+    pin_when_collapsed: bool = True
     opacity: float = 1.0
     #: A palette name from ``ui.theme.PALETTES``, or ``"system"`` to track
     #: the OS's own light/dark setting instead of naming one directly.
     theme: str = "dark"
+    #: How an hour figure reads on screen — "clock" (``7h 30m``) or "decimal"
+    #: (``7.5``). One setting for the whole app, next to Theme in
+    #: Preferences, rather than per label; never applied to what gets
+    #: exported or copied out, which always stays decimal regardless (see
+    #: ``dates.format_duration``).
+    hour_format: str = "clock"
+    #: How a calendar date reads on screen — "iso" (``2026-11-13``, the
+    #: default), "dmy" (``13/11/2026``), "mdy" (``11/13/2026``) or "text"
+    #: (``13 Nov 2026``). See ``dates.set_date_format``. Never applied to
+    #: stored dates or export filenames, which stay ISO.
+    date_format: str = "iso"
     #: Step size (minutes) offered by every duration picker — Actual/Planned
     #: Hours, a recurring note's own minutes, the Daily target, and so on.
     #: Never applied to what's exported; those figures always stay exact.
@@ -201,17 +266,55 @@ class Settings:
     #: default), "project", "phase" or "task". One setting for the whole
     #: app rather than per-day, since it's a viewing preference, not data.
     day_grouping: str = "manual"
+    #: How the Week tab groups its tasks — "project" (the default) or
+    #: "customer". Same kind of setting as ``day_grouping``.
+    week_grouping: str = "project"
     #: A corner from ``monitors.CORNERS``; "" leaves the overlay where it is dragged.
     snap_corner: str = ""
     #: Device name of the screen to snap to. "" means whichever is primary.
     snap_screen: str = ""
     #: Put an icon in the notification area. Closing then hides rather than quits.
     tray: bool = True
+    #: Auto-pauses a running timer once no mouse or keyboard input has been
+    #: seen, system-wide, for ``idle_pause_minutes`` — see
+    #: ``timesheet.idle`` and ``Overlay._poll_idle``. On by default: a
+    #: timer left running at an away desk otherwise just keeps counting,
+    #: same problem Teams' own "Away" status exists to catch.
+    idle_auto_pause: bool = True
+    #: Minutes of no input before that auto-pause kicks in. Matches
+    #: Microsoft Teams' own default "Away" threshold (5 minutes) out of the
+    #: box, on the theory that a timer pausing in step with whatever your
+    #: own status is already about to say reads as one consistent idea of
+    #: "stepped away", not two unrelated ones on different clocks — but
+    #: it's independent of Teams entirely (nothing here talks to it), so
+    #: changing this never changes what Teams itself decides.
+    idle_pause_minutes: int = 5
     #: Global-hotkey overrides, keyed by action name ("collapse", "pin",
     #: "timer"). An action missing here just uses ``overlay.DEFAULT_HOTKEYS``
     #: — this dict only holds what the user has changed away from default,
     #: so "reset to default" is simply removing the entry.
     hotkeys: dict[str, str] = field(default_factory=dict)
+    #: A ``#rrggbb`` override for the Day tab's progress bar, replacing
+    #: every one of its usual state colours (blue while logging, green at
+    #: target, amber for outstanding plan, red over-committed) with this
+    #: one colour regardless of state — "" (the default) leaves the bar
+    #: showing those colours as it always has. The first of several
+    #: planned "customise this component's colour" settings (see
+    #: ``timesheet.ui.setup``'s own Preferences tab) — everything else
+    #: still reads straight off ``ui.theme``.
+    progress_bar_color: str = ""
+    #: Same idea for the planned (outstanding) stretch of that bar. "" keeps
+    #: its usual amber / red-when-over-committed state colours.
+    planned_bar_color: str = ""
+    #: Working day as minutes after midnight. The Day tab's progress bar
+    #: spans start..end and marks every half hour between them.
+    work_start_minutes: int = 9 * 60
+    work_end_minutes: int = 17 * 60
+    #: A lunch break inside the work day, left out of the progress bar's
+    #: timeline (what's logged measures against the working time left).
+    lunch_enabled: bool = True
+    lunch_start_minutes: int = 12 * 60
+    lunch_end_minutes: int = 13 * 60
 
 
 @dataclass
@@ -303,6 +406,13 @@ class Database:
         )
 
         timer_raw = raw.get("active_timer")
+        if timer_raw and "day_anchor" not in timer_raw:
+            # A file saved before pausing existed never had a reason to
+            # separate "which day this belongs to" from "when the current
+            # segment began" — they were the same field. Carrying the old
+            # ``started_at`` over as this timer's fixed day anchor keeps
+            # that day the same one it always would have been.
+            timer_raw = {**timer_raw, "day_anchor": timer_raw.get("started_at")}
         timer = ActiveTimer(**timer_raw) if timer_raw else None
 
         tasks, migrated_notes = build_tasks(raw.get("tasks"))

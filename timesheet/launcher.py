@@ -21,6 +21,31 @@ from . import paths
 
 NAME = "Timesheet Logger"
 
+#: Identifies this app to Windows independently of the interpreter running
+#: it. Without this, every surface that shows "which app is this" — Task
+#: Manager's process list chief among them — falls back to describing the
+#: host instead: ``pythonw.exe``'s own file description, "Python 3.12
+#: (Windowed)", with the stock Python icon, since an overlay that's a toolwindow
+#: (hidden from the taskbar on purpose) gives Windows no app window of its
+#: own to read a title and icon off instead.
+APP_USER_MODEL_ID = "TimesheetLogger.Overlay"
+
+
+def claim_app_identity() -> None:
+    """Tells Windows this process is its own app, not "Python".
+
+    Best-effort and silent on failure — a mislabelled Task Manager row is a
+    cosmetic slip, not a reason to crash. Must run before the first window
+    is created; Windows reads it once and ignores anything set afterwards.
+    """
+    try:
+        set_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        set_id.argtypes = [wintypes.LPCWSTR]
+        set_id(APP_USER_MODEL_ID)
+    except OSError:
+        pass
+
+
 #: KNOWNFOLDERID values, from ``KnownFolders.h``. The Desktop is looked up
 #: rather than assumed to be ``~/Desktop``, because OneDrive moves it.
 FOLDERID_DESKTOP = "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"

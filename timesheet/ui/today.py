@@ -18,11 +18,13 @@ rows together while reordering within (and across) them.
 from __future__ import annotations
 
 import tkinter as tk
+from types import SimpleNamespace
 
 from ..dates import add_days, format_duration, pretty_date, today
 from ..models import ActiveTimer, Entry, Recurrence
 from ..store import DayRow, Store, TaskContext
 from .navrow import NavRow
+from .. import anim, dwm, winfx
 from . import controls, icons, modern, theme
 from .repeat import RepeatEditor
 from .scroll import ScrollFrame
@@ -132,6 +134,8 @@ class TodayView:
         #: row's own widget, so a drop position can be read off its geometry.
         self._drag_id: str | None = None
         self._row_widgets: list[tuple[str, tk.Widget]] = []
+        self._refreshing = False
+        self._refresh_again = False
         #: The live "it'll land here" bar shown while dragging — created on
         #: the first motion of a given drag, torn down the moment it ends.
         self._drop_indicator: tk.Frame | None = None
@@ -420,6 +424,210 @@ class TodayView:
     # -- rendering ---------------------------------------------------------
 
     def refresh(self) -> None:
+        # Building a row calls ``update_idletasks``, which runs the overlay's
+        # own queued rebuild (see ``Overlay.refresh``) in the middle of this
+        # pass: two passes then interleave and each builds the same block,
+        # leaving a duplicate card until a later pass tears it down. A
+        # request that arrives mid-pass is run once, right after it instead.
+        if self._refreshing:
+            self._refresh_again = True
+            return
+        self._refreshing = True
+        try:
+            motion = self._motion_begin()
+            try:
+                self._refresh_once()
+                while self._refresh_again:
+                    self._refresh_again = False
+                    self._refresh_once()
+            except BaseException:
+                if motion is not None:
+                    self._motion_abort(motion)
+                raise
+            if motion is not None:
+                self._motion_end(motion)
+            self._motion_date = self.date
+        finally:
+            self._refreshing = False
+            self._refresh_again = False
+
+    # -- card motion ------------------------------------------------------
+    #
+    # When a refresh moves cards (a new one slides in at the top, one is
+    # removed, a card grows), they glide to their new places instead of
+    # snapping. Same recipe as the window animations (see animations.mdc):
+    # the real window is rebuilt hidden under a snapshot, and only a ghost
+    # window is animated — each card is a strip of the before/after
+    # snapshots moved a little each frame.
+
+    MOTION_MS = 240
+
+    def _block_geometry(self) -> dict:
+        """Each block's ``(signature, top, height)`` within the viewport."""
+        canvas = self.scroll._canvas
+        top = canvas.winfo_rooty()
+        out = {}
+        for key, (signature, widgets) in getattr(self.scroll, "_blocks", {}).items():
+            live = [w for w in widgets if w.winfo_exists() and w.winfo_ismapped()]
+            if not live:
+                continue
+            y0 = min(w.winfo_rooty() for w in live) - top
+            y1 = max(w.winfo_rooty() + w.winfo_height() for w in live) - top
+            out[key] = (signature, y0, y1 - y0)
+        return out
+
+    def _motion_begin(self):
+        """A snapshot of the window and its cards' places, taken before the
+        rebuild — or ``None`` when this refresh should just apply in place."""
+        overlay = self.overlay
+        try:
+            if (
+                not getattr(self.scroll, "_blocks", None)
+                or getattr(self, "_motion_date", None) != self.date
+                or self._modal is not None
+                or self._day_loading
+                or overlay.collapsed
+                or getattr(overlay, "_morphing", False)
+                or getattr(overlay, "_cover", None) is not None
+                or getattr(overlay, "_build_name", None) is not None
+                or overlay.root.state() == "withdrawn"
+                or not self.scroll.winfo_ismapped()
+            ):
+                return None
+            rect = (
+                overlay.root.winfo_x(), overlay.root.winfo_y(),
+                overlay.root.winfo_width(), overlay.root.winfo_height(),
+            )
+            if rect[2] < 2 or rect[3] < 2:
+                return None
+            # Only a change to which cards there are, or their order, moves
+            # anything worth animating; everything else updates in place.
+            shown = [k[1] for k in self.scroll._blocks if k[0] == "row"]
+            coming = [
+                r.id for _heading, rows in self.store.grouped_day_rows(self.date)
+                for r in rows
+            ]
+            if shown == coming:
+                return None
+            hwnd = overlay._hwnd()
+            before = winfx.capture(hwnd, rect[2], rect[3])
+        except (OSError, tk.TclError):
+            return None
+        canvas = self.scroll._canvas
+        root = overlay.root
+        viewport = (
+            canvas.winfo_rootx() - root.winfo_rootx(),
+            canvas.winfo_rooty() - root.winfo_rooty(),
+            canvas.winfo_width(), canvas.winfo_height(),
+        )
+        motion = {
+            "hwnd": hwnd, "rect": rect, "before": before, "viewport": viewport,
+            "old": self._block_geometry(), "scroll": canvas.canvasy(0), "ghost": None,
+        }
+        # Cover the window now, before anything is rebuilt, so neither the
+        # cards being built nor the layout settling is ever on screen.
+        try:
+            ghost = winfx.Ghost(rect[2], rect[3])
+            motion["ghost"] = ghost
+            dwm.corners(ghost.hwnd, dwm.ROUNDED)
+            ghost.draw(rect, before, before, 0.0, overlay.store.db.settings.opacity)
+            anim._vsync()  # on screen before the real window goes transparent
+            overlay._morphing = True
+            overlay._raise_shield(rect)
+            overlay.root.attributes("-alpha", 0.0)
+        except (OSError, tk.TclError):
+            self._motion_abort(motion)
+            return None
+        return motion
+
+    def _motion_abort(self, motion: dict) -> None:
+        """Puts the window back as it was, with no animation."""
+        overlay = self.overlay
+        try:
+            overlay.root.attributes("-alpha", overlay.store.db.settings.opacity)
+        except tk.TclError:
+            pass
+        overlay._morphing = False
+        overlay._drop_shield()
+        for item in (motion.get("ghost"), motion.get("before")):
+            if item is not None:
+                item.close()
+        motion["ghost"] = motion["before"] = None
+
+    def _motion_end(self, motion: dict) -> None:
+        """Called once the rebuild has finished (or failed): reveals it,
+        gliding the cards if any of them moved."""
+        overlay = self.overlay
+        hwnd, rect, before = motion["hwnd"], motion["rect"], motion["before"]
+        ghost = motion["ghost"]
+        after = frame = None
+        hidden = True
+        try:
+            # Lay the rebuilt widgets out first: until then new blocks are
+            # unmapped and survivors still report their old places.
+            overlay.root.update_idletasks()
+            new = self._block_geometry()
+            old = motion["old"]
+            moved = (
+                set(old) != set(new)
+                or any(abs(old[k][1] - new[k][1]) >= 2 for k in new if k in old)
+            ) and abs(self.scroll._canvas.canvasy(0) - motion["scroll"]) < 1
+            opacity = overlay.store.db.settings.opacity
+            if not moved:
+                return  # the finally restores the window under the snapshot
+            after = winfx.capture(hwnd, rect[2], rect[3])
+            frame = winfx.new_surface(rect[2], rect[3])
+            vx, vy, vw, vh = motion["viewport"]
+            clip = (vx, vy, vw, vh)
+
+            def compose(t: float) -> None:
+                winfx.blit(frame, after, 0, 0, 0, 0, rect[2], rect[3])
+                winfx.fill(frame, clip, theme.BG)
+                # Nothing ever overlaps: a card that leaves closes up from
+                # the bottom while the ones below slide up into its place; one
+                # that arrives opens down from its top edge while the ones
+                # below slide down out of its way. Every card that stays is
+                # drawn once, from the finished layout, at its in-between spot.
+                for key in old:
+                    if key not in new:
+                        _sig, y, h = old[key]
+                        winfx.blit(frame, before, vx, vy + y, vx, vy + y, vw,
+                                   round(h * (1 - t)), 1, clip)
+                for key, (_sig, y, h) in new.items():
+                    if key not in old:
+                        winfx.blit(frame, after, vx, vy + y, vx, vy + y, vw,
+                                   round(h * t), 1, clip)
+                    else:
+                        now = round(anim.lerp(old[key][1], y, t))
+                        winfx.blit(frame, after, vx, vy + now, vx, vy + y, vw, h, 1, clip)
+                ghost.draw(rect, frame, frame, 0.0, opacity)
+
+            anim.run(self.MOTION_MS, compose, easing=anim.ease_out_cubic)
+            # Reveal: the real window back (already laid out), the ghost
+            # fading away over it.
+            overlay.root.attributes("-alpha", opacity)
+            hidden = False
+            overlay._drop_shield()
+            ghost.set_click_through(True)
+            anim.run(
+                120, lambda t: ghost.draw(rect, frame, frame, 0.0, opacity * (1 - t)),
+                easing=anim.smoothstep,
+            )
+        except (OSError, tk.TclError):
+            pass  # no motion is a fine fallback: the rebuild is already done
+        finally:
+            if hidden:
+                try:
+                    overlay.root.attributes("-alpha", overlay.store.db.settings.opacity)
+                except tk.TclError:
+                    pass
+            overlay._morphing = False
+            overlay._drop_shield()
+            for item in (ghost, after, frame, before):
+                if item is not None:
+                    item.close()
+
+    def _refresh_once(self) -> None:
         theme.commit_focused_entry(self.frame)
         self.date_label.set_text(self._nav_date_text())
         self.date_label.set_highlight(self.date == today())
@@ -1194,8 +1402,41 @@ class TodayView:
         start typing straight away instead of having to click into it."""
 
         def add() -> None:
-            entry = self.store.add_entry(context.task.id, self.date, 0, "")
+            task_rows = [
+                r for r in self.store.day_rows(self.date)
+                if r.context.task.id == context.task.id
+            ]
+            # A plan-only placeholder (nothing logged yet) vanishes the
+            # moment any entry exists, so the new card would take its place.
+            # Make it a real, 0m entry first so it stays and moves down.
+            for placeholder in task_rows:
+                if placeholder.entry is None and placeholder.id.startswith("task:"):
+                    kept = self.store.add_entry(
+                        context.task.id, self.date, 0, placeholder.plan_note,
+                        plan_minutes=placeholder.plan_minutes, clear_plan=True,
+                    )
+                    if kept is not None:
+                        # Same spot in a saved drag order, under its new id.
+                        saved = [
+                            kept.id if rid == placeholder.id else rid
+                            for rid in self.store.day_order_for(self.date)
+                        ]
+                        if saved != self.store.day_order_for(self.date):
+                            self.store.set_day_order(self.date, saved)
+                        task_rows = [
+                            r for r in task_rows if r is not placeholder
+                        ] + [SimpleNamespace(id=kept.id)]
+                    break
+            task_row_ids = {r.id for r in task_rows}
+            entry = self.store.add_entry(context.task.id, self.date, 0, "", first=True)
             if entry is not None:
+                # A saved drag order sorts unknown rows after known ones, so
+                # slot the new row in ahead of this task's first row there.
+                order = list(self.store.day_order_for(self.date))
+                spots = [i for i, rid in enumerate(order) if rid in task_row_ids]
+                if spots:
+                    order.insert(min(spots), entry.id)
+                    self.store.set_day_order(self.date, order)
                 self._focus_entry_id = entry.id
                 self._fresh_entries.add(entry.id)
 

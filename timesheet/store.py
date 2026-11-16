@@ -822,7 +822,7 @@ class Store:
     def add_entry(
         self, task_id: str, date: ISODate, minutes: int, note: str = "",
         recurring_note_id: str = "", internal_note: str = "", plan_minutes: int = 0,
-        clear_plan: bool = False,
+        clear_plan: bool = False, first: bool = False,
     ) -> Entry | None:
         """Logs a new entry. ``minutes`` of exactly 0 is a deliberate,
         allowed value — "+ log another entry" starts one that way, left for
@@ -867,7 +867,17 @@ class Store:
             source="manual", recurring_note_id=recurring_note_id,
             internal_note=internal_note, plan_minutes=plan_minutes,
         )
-        self.db.entries.append(entry)
+        # ``first`` puts it ahead of the task's other entries for the day
+        # (rows follow entry order), rather than after them.
+        at = next(
+            (i for i, e in enumerate(self.db.entries)
+             if first and e.task_id == task_id and e.date == date),
+            None,
+        )
+        if at is None:
+            self.db.entries.append(entry)
+        else:
+            self.db.entries.insert(at, entry)
         if clear_plan:
             self.db.plans = [
                 p for p in self.db.plans if not (p.task_id == task_id and p.date == date)

@@ -198,6 +198,46 @@ def solid(colour: str) -> _Surface:
     ctypes.memmove(surface.bits, bytes((blue, green, red, 0)), 4)
     return surface
 
+def new_surface(width: int, height: int) -> _Surface:
+    """An empty surface a caller can compose a frame on with :func:`blit`."""
+    return _Surface(width, height)
+
+
+def blit(
+    dst: _Surface, src: _Surface, x: int, y: int, sx: int, sy: int, w: int, h: int,
+    alpha: float = 1.0, clip: tuple | None = None,
+) -> None:
+    """Copies the ``w x h`` part of ``src`` at ``(sx, sy)`` onto ``dst`` at
+    ``(x, y)`` 1:1, at ``alpha`` opacity, cut off outside ``clip``
+    (``x, y, w, h`` on ``dst``; the whole of ``dst`` by default)."""
+    cx, cy, cw, ch = clip if clip is not None else (0, 0, dst.width, dst.height)
+    # Trim the copy to the clip rectangle (and to what ``src`` actually has).
+    left = max(0, cx - x)
+    top = max(0, cy - y)
+    right = min(w, cx + cw - x, src.width - sx)
+    bottom = min(h, cy + ch - y, src.height - sy)
+    if right - left <= 0 or bottom - top <= 0 or alpha <= 0:
+        return
+    args = (
+        x + left, y + top, right - left, bottom - top,
+        src.dc, sx + left, sy + top, right - left, bottom - top,
+    )
+    if alpha >= 1:
+        gdi32.StretchBlt(dst.dc, *args, _SRCCOPY)
+    else:
+        msimg32.AlphaBlend(dst.dc, *args, _BLENDFUNCTION(0, 0, round(255 * alpha), 0))
+
+
+def fill(dst: _Surface, rect: tuple, colour: str) -> None:
+    """Paints ``rect`` (``x, y, w, h``) of ``dst`` one ``#rrggbb`` colour."""
+    swatch = solid(colour)
+    try:
+        x, y, w, h = rect
+        gdi32.StretchBlt(dst.dc, x, y, w, h, swatch.dc, 0, 0, 1, 1, _SRCCOPY)
+    finally:
+        swatch.close()
+
+
 class Ghost:
     """A click-through layered window that displays two snapshots, scaled to
     the same rect and cross-faded by ``mix`` (0 = all ``a``, 1 = all ``b``)."""

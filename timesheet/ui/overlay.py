@@ -2929,6 +2929,11 @@ class Overlay:
                 if item is not None:
                     item.close()
             return None
+        # The real window is fully transparent from here to ``_cover_end``,
+        # and Windows lets clicks fall through a fully transparent window to
+        # whatever app is behind it. The ghost is click-through too, so
+        # without a shield a click during a rebuild lands on that app.
+        self._raise_shield(rect)
         self._cover = (ghost, snap)
         return self._cover
 
@@ -2944,6 +2949,7 @@ class Overlay:
             self.root.update()
             opacity = self.store.db.settings.opacity
             self.root.attributes("-alpha", opacity)
+            self._drop_shield()  # the real window is opaque again
             self.root.update_idletasks()
             if fade:
                 # The snapshot is still over the live window (click-through):
@@ -2956,6 +2962,7 @@ class Overlay:
                 return
         finally:
             self._cover = None
+            self._drop_shield()
             if not handed_off:
                 ghost.close()
                 snap.close()
